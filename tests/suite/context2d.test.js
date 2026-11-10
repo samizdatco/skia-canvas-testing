@@ -1,0 +1,3228 @@
+// @ts-check
+
+"use strict"
+
+
+const {assert} = require('../runner/assert'),
+      {describe, test, beforeEach, afterEach} = require('node:test'),
+      {Canvas, DOMMatrix, DOMPoint, ImageData, Path2D, FontLibrary, loadImage, loadCanvas} = require('../../lib'),
+      css = require('../../lib/classes/css')
+
+const BLACK = [0,0,0,255],
+      WHITE = [255,255,255,255],
+      GREEN = [0,128,0,255],
+      CLEAR = [0,0,0,0]
+
+const _each = (obj, fn) => Object.entries(obj).forEach(([term, val]) => fn(val, term))
+
+describe("Context2D", ()=>{
+  /** @type {Canvas} */
+  let canvas
+  /** @type {import('../../lib').CanvasRenderingContext2D} */
+  let ctx
+  let WIDTH = 512, HEIGHT = 512,
+      pixel = (x, y) => Array.from(ctx.getImageData(x, y, 1, 1).data),
+      loadAsset = url => loadImage(`tests/assets/${url}`),
+      mockedWarn = () => {},
+      realWarn = console.warn;
+
+  beforeEach(() => {
+    canvas = new Canvas(WIDTH, HEIGHT)
+    ctx = canvas.getContext("2d")
+    console.warn = mockedWarn
+  })
+
+  afterEach(() => {
+    console.warn = realWarn
+  })
+
+  describe("can get & set", ()=>{
+
+    test('currentTransform', () => {
+      ctx.scale(0.1, 0.3)
+      let matrix = ctx.currentTransform
+      _each({a:0.1, b:0, c:0, d:0.3, e:0, f:0}, (val, term) =>
+        assert.nearEqual(matrix[term], val)
+      )
+
+      ctx.resetTransform()
+      _each({a:1, d:1}, (val, term) =>
+        assert.nearEqual(ctx.currentTransform[term], val)
+      )
+
+      ctx.currentTransform = matrix
+      _each({a:0.1, d:0.3}, (val, term) =>
+        assert.nearEqual(ctx.currentTransform[term], val)
+      )
+    })
+
+    test('font', () => {
+      assert.equal(ctx.font, '10px sans-serif')
+      let font = '16px Baskerville, serif',
+          canonical = css.font(font).canonical;
+      ctx.font = font
+      assert.equal(ctx.font, canonical)
+      ctx.font = 'invalid'
+      assert.equal(ctx.font, canonical)
+
+      // re-assigning `font` to the value it already reports is a no-op — the implicit default must
+      // resolve the same metrics as an explicit assignment (fresh ctx so no font was ever set)
+      let dctx = new Canvas(WIDTH, HEIGHT).getContext('2d')
+      let implicit = dctx.measureText('Mg')
+      dctx.font = dctx.font
+      let explicit = dctx.measureText('Mg')
+      assert.nearEqual(implicit.hangingBaseline, explicit.hangingBaseline)
+      assert.nearEqual(implicit.ideographicBaseline, explicit.ideographicBaseline)
+      assert.nearEqual(implicit.fontBoundingBoxAscent, explicit.fontBoundingBoxAscent)
+    })
+
+    test('globalAlpha', () => {
+      assert.equal(ctx.globalAlpha, 1)
+      ctx.globalAlpha = 0.25
+      assert.nearEqual(ctx.globalAlpha, 0.25)
+      ctx.globalAlpha = -1
+      assert.nearEqual(ctx.globalAlpha, 0.25)
+      ctx.globalAlpha = 3
+      assert.nearEqual(ctx.globalAlpha, 0.25)
+      ctx.globalAlpha = 0
+      assert.equal(ctx.globalAlpha, 0)
+    })
+
+    test('globalCompositeOperation', () => {
+      let ops = /** @type {const} */ (["source-over", "destination-over", "copy", "destination", "clear",
+                 "source-in", "destination-in", "source-out", "destination-out",
+                 "source-atop", "destination-atop", "xor", "lighter", "multiply",
+                 "screen", "overlay", "darken", "lighten", "color-dodge", "color-burn",
+                 "hard-light", "soft-light", "difference", "exclusion", "hue",
+                 "saturation", "color", "luminosity"])
+
+      assert.equal(ctx.globalCompositeOperation, 'source-over')
+      // @ts-expect-error — deliberately invalid enum value
+      ctx.globalCompositeOperation = 'invalid'
+      assert.equal(ctx.globalCompositeOperation, 'source-over')
+
+      for (let op of ops){
+        ctx.globalCompositeOperation = op
+        assert.equal(ctx.globalCompositeOperation, op)
+      }
+    })
+
+    test('imageSmoothingEnabled', () => {
+      assert.equal(ctx.imageSmoothingEnabled, true)
+      ctx.imageSmoothingEnabled = false
+      assert.equal(ctx.imageSmoothingEnabled, false)
+    })
+
+
+    test('imageSmoothingQuality', () => {
+      let vals = /** @type {const} */ (["low", "medium", "high"])
+
+      assert.equal(ctx.imageSmoothingQuality, 'low')
+      // @ts-expect-error — deliberately invalid enum value
+      ctx.imageSmoothingQuality = 'invalid'
+      assert.equal(ctx.imageSmoothingQuality, 'low')
+
+      for (let val of vals){
+        ctx.imageSmoothingQuality = val
+        assert.equal(ctx.imageSmoothingQuality, val)
+      }
+    })
+
+    test('lineCap', () => {
+      let vals = /** @type {const} */ (["butt", "square", "round"])
+
+      assert.equal(ctx.lineCap, 'butt')
+      // @ts-expect-error — deliberately invalid enum value
+      ctx.lineCap = 'invalid'
+      assert.equal(ctx.lineCap, 'butt')
+
+      for (let val of vals){
+        ctx.lineCap = val
+        assert.equal(ctx.lineCap, val)
+      }
+    })
+
+    test('lineDash', () => {
+      assert.deepEqual(ctx.getLineDash(), [])
+      ctx.setLineDash([1,2,3,4])
+      assert.deepEqual(ctx.getLineDash(), [1,2,3,4])
+      ctx.setLineDash([NaN])
+      assert.deepEqual(ctx.getLineDash(), [1,2,3,4])
+    })
+
+    test('lineJoin', () => {
+      let vals = /** @type {const} */ (["miter", "round", "bevel"])
+
+      assert.equal(ctx.lineJoin, 'miter')
+      // @ts-expect-error — deliberately invalid enum value
+      ctx.lineJoin = 'invalid'
+      assert.equal(ctx.lineJoin, 'miter')
+
+      for (let val of vals){
+        ctx.lineJoin = val
+        assert.equal(ctx.lineJoin, val)
+      }
+    })
+
+    test('lineWidth', () => {
+      ctx.lineWidth = 10.0;
+      assert.equal(ctx.lineWidth, 10)
+      ctx.lineWidth = Infinity;
+      assert.equal(ctx.lineWidth, 10)
+      ctx.lineWidth = -Infinity;
+      assert.equal(ctx.lineWidth, 10)
+      ctx.lineWidth = -5;
+      assert.equal(ctx.lineWidth, 10)
+      ctx.lineWidth = 0;
+      assert.equal(ctx.lineWidth, 10)
+    })
+
+    test('textAlign', () => {
+      let vals = /** @type {const} */ (["start", "end", "left", "center", "right", "justify"])
+
+      assert.equal(ctx.textAlign, 'start')
+      // @ts-expect-error — deliberately invalid enum value
+      ctx.textAlign = 'invalid'
+      assert.equal(ctx.textAlign, 'start')
+
+      for (let val of vals){
+        ctx.textAlign = val
+        assert.equal(ctx.textAlign, val)
+      }
+    })
+
+  })
+
+  describe("can create", ()=>{
+    test('a context', () => {
+      assert.strictEqual(canvas.getContext("invalid"), null)
+      assert.strictEqual(canvas.getContext("2d"), ctx)
+      assert.strictEqual(canvas.pages[0], ctx)
+      assert.strictEqual(ctx.canvas, canvas)
+    })
+
+    test('a display-p3 colorSpace', async () => {
+      let canvas = new Canvas(4, 4),
+          ctx = canvas.getContext('2d', {colorSpace:'display-p3'})
+      // the browser's four settings (colorSpace latched, the rest fixed defaults) plus the page's size
+      assert.deepEqual(ctx.getContextAttributes(), {alpha:true, colorSpace:'display-p3', desynchronized:false, willReadFrequently:false, width:4, height:4})
+
+      ctx.fillStyle = '#f00'
+      ctx.fillRect(0, 0, 4, 4)
+
+      // getImageData/createImageData & exports default to the canvas's space…
+      let bmp = ctx.getImageData(0, 0, 1, 1)
+      assert.equal(bmp.colorSpace, 'display-p3')
+      assert.deepEqual(Array.from(bmp.data), [234, 51, 35, 255])
+      assert.equal(ctx.createImageData(2, 2).colorSpace, 'display-p3')
+      assert.deepEqual(Array.from((await canvas.toBuffer('raw')).slice(0, 4)), [234, 51, 35, 255])
+      assert((await canvas.toBuffer('png')).includes('iCCP'))
+
+      // …and getImageData's per-call setting can still override (exports cannot: they always
+      // render in the page's own space)
+      assert.deepEqual(Array.from(ctx.getImageData(0, 0, 1, 1, {colorSpace:'srgb'}).data), [255, 0, 0, 255])
+
+      // only the first getContext call's settings are honored
+      assert.equal(canvas.getContext('2d', {colorSpace:'srgb'}), ctx)
+      assert.equal(ctx.getContextAttributes().colorSpace, 'display-p3')
+
+      // a canvas whose context was created without settings defaults to srgb
+      let plain = new Canvas(4, 4).getContext('2d')
+      assert.equal(plain.getContextAttributes().colorSpace, 'srgb')
+    })
+
+    test('multiple pages', () => {
+      let ctx2 = canvas.newPage(WIDTH*2, HEIGHT*2);
+      assert.equal(canvas.width, WIDTH*2)
+      assert.equal(canvas.height, HEIGHT*2)
+      assert.strictEqual(canvas.pages[0], ctx)
+      assert.strictEqual(canvas.pages[1], ctx2)
+      assert.strictEqual(ctx.canvas, canvas)
+      assert.strictEqual(ctx2.canvas, canvas)
+    })
+
+    test('per-page context attributes', async () => {
+      let canvas = new Canvas(4, 4),
+          p1 = canvas.getContext('2d', {colorSpace:'display-p3', willReadFrequently:true})
+
+      // the first page's settings become the defaults inherited by every page after it
+      assert.matchesSubset(p1.getContextAttributes(), {colorSpace:'display-p3', willReadFrequently:true})
+      assert.matchesSubset(canvas.newPage().getContextAttributes(), {colorSpace:'display-p3', willReadFrequently:true})
+      assert.matchesSubset(canvas.newPage(8, 8).getContextAttributes(), {colorSpace:'display-p3', willReadFrequently:true})
+
+      // …but an individual page can override them
+      let srgb = canvas.newPage({colorSpace:'srgb', willReadFrequently:false})
+      assert.matchesSubset(srgb.getContextAttributes(), {colorSpace:'srgb', willReadFrequently:false})
+      assert.equal(canvas.width, 8) // the settings-only form doesn't resize
+
+      // an override applies to that page alone & doesn't redefine what later pages inherit
+      assert.matchesSubset(canvas.newPage().getContextAttributes(), {colorSpace:'display-p3', willReadFrequently:true})
+      assert.matchesSubset(p1.getContextAttributes(), {colorSpace:'display-p3', willReadFrequently:true})
+
+      // the three-argument form both resizes and overrides
+      let big = canvas.newPage(16, 32, {colorSpace:'srgb'})
+      assert.matchesSubset(big.getContextAttributes(), {colorSpace:'srgb', willReadFrequently:true})
+      assert.equal(canvas.width, 16)
+      assert.equal(canvas.height, 32)
+
+      // each page rasterizes in its own space
+      for (const {ctx, expected} of [{ctx:p1, expected:[234, 51, 35, 255]}, {ctx:srgb, expected:[255, 0, 0, 255]}]){
+        ctx.fillStyle = '#f00'
+        ctx.fillRect(0, 0, 8, 8)
+        assert.deepEqual(Array.from(ctx.getImageData(0, 0, 1, 1).data), expected)
+        assert.deepEqual(Array.from((await canvas.toBuffer('raw', {page:canvas.pages.indexOf(ctx) + 1})).slice(0, 4)), expected)
+      }
+    })
+
+    test('per-page color spaces', async () => {
+      let canvas = new Canvas(4, 4)
+      canvas.getContext('2d', {colorSpace:'display-p3'})
+      canvas.newPage({colorSpace:'srgb'})
+      for (const ctx of canvas.pages){
+        ctx.fillStyle = '#f00'
+        ctx.fillRect(0, 0, 4, 4)
+      }
+
+      // each page exports in the space it was created with…
+      assert.deepEqual(Array.from((await canvas.toBuffer('raw', {page:1})).slice(0, 4)), [234, 51, 35, 255])
+      assert.deepEqual(Array.from((await canvas.toBuffer('raw', {page:2})).slice(0, 4)), [255, 0, 0, 255])
+
+      // …including when it's implicitly the 'current' page
+      assert.deepEqual(Array.from((await canvas.toBuffer('raw')).slice(0, 4)), [255, 0, 0, 255])
+
+      // there's no export-level override: a colorSpace option is simply not a thing
+      // @ts-expect-error — deliberately removed export option
+      assert.deepEqual(Array.from((await canvas.toBuffer('raw', {colorSpace:'display-p3'})).slice(0, 4)), [255, 0, 0, 255])
+
+      // resizing a page keeps its color space (the recorder is rebuilt from scratch)
+      canvas.width = 8
+      assert.equal(canvas.pages[1].getContextAttributes().colorSpace, 'srgb')
+      let p3 = new Canvas(4, 4)
+      let p3ctx = p3.getContext('2d', {colorSpace:'display-p3'})
+      p3.width = 8
+      p3ctx.fillStyle = '#f00'
+      p3ctx.fillRect(0, 0, 8, 8)
+      assert.deepEqual(Array.from((await p3.toBuffer('raw')).slice(0, 4)), [234, 51, 35, 255])
+    })
+
+    test("ImageData", () => {
+      let [width, height] = [123, 456],
+          bmp = ctx.createImageData(width, height);
+      assert.equal(bmp.width, width)
+      assert.equal(bmp.height, height)
+      assert.equal(bmp.data.length, width * height * 4)
+      assert.deepEqual(Array.from(bmp.data.slice(0,4)), CLEAR)
+
+      let blank = new ImageData(width, height)
+      assert.equal(blank.width, width)
+      assert.equal(blank.height, height)
+      assert.equal(blank.data.length, width * height * 4)
+      assert.deepEqual(Array.from(blank.data.slice(0,4)), CLEAR)
+
+      new ImageData(blank.data, width, height)
+      new ImageData(blank.data, height, width)
+      new ImageData(blank.data, width)
+      new ImageData(blank.data, height)
+      assert.throws(() => new ImageData(blank.data, width+1, height) )
+      assert.throws(() => new ImageData(blank.data, width+1) )
+
+      // @ts-ignore
+      new ImageData(blank)
+      // @ts-ignore
+      assert.throws(() => new ImageData(blank.data) )
+    })
+
+    describe("CanvasPattern", () => {
+      test("from Image", async () => {
+        let image = await loadAsset('checkers.png'),
+            pattern = ctx.createPattern(image, 'repeat'),
+            [width, height] = [20, 20];
+
+        ctx.imageSmoothingEnabled = false
+        ctx.fillStyle = pattern;
+        ctx.fillRect(0,0,width,height)
+
+        let bmp = ctx.getImageData(0,0,width,height)
+        let blackPixel = true
+        assert.equal(bmp.data.length, width * height * 4)
+        for (var i=0; i<bmp.data.length; i+=4){
+          if (i % (bmp.width*4) != 0) blackPixel = !blackPixel
+          assert.deepEqual(Array.from(bmp.data.slice(i, i+4)),
+            blackPixel ? BLACK : WHITE
+          )
+        }
+      })
+
+      test("from a page context", () => {
+        let checkers = new Canvas(2, 2),
+            page1 = checkers.getContext('2d')
+        page1.fillStyle = 'white'
+        page1.fillRect(0, 0, 2, 2)
+        page1.fillStyle = 'black'
+        page1.fillRect(0, 0, 1, 1)
+        page1.fillRect(1, 1, 1, 1)
+        checkers.newPage() // a blank newer page: the context arg must still select page 1
+
+        ctx.imageSmoothingEnabled = false
+        ctx.fillStyle = ctx.createPattern(checkers.pages[0], 'repeat')
+        ctx.fillRect(0, 0, 20, 20)
+
+        assert.deepEqual(pixel(0, 0), BLACK)
+        assert.deepEqual(pixel(1, 0), WHITE)
+        assert.deepEqual(pixel(0, 1), WHITE)
+        assert.deepEqual(pixel(1, 1), BLACK)
+      })
+
+      test("from ImageData", () => {
+        let blank = new Canvas()
+        ctx.fillStyle = ctx.createPattern(blank, 'repeat');
+        ctx.fillRect(0,0, 20,20);
+
+        let checkers = new Canvas(2, 2),
+            patCtx = checkers.getContext("2d");
+        patCtx.fillStyle = 'white';
+        patCtx.fillRect(0,0,2,2);
+        patCtx.fillStyle = 'black';
+        patCtx.fillRect(0,0,1,1);
+        patCtx.fillRect(1,1,1,1);
+
+        let checkersData = patCtx.getImageData(0,0,2,2)
+
+        let pattern = ctx.createPattern(checkersData, 'repeat')
+        ctx.fillStyle = pattern;
+        ctx.fillRect(0,0, 20,20);
+
+        let bmp = ctx.getImageData(0,0, 20,20)
+        let blackPixel = true
+        for (var i=0; i<bmp.data.length; i+=4){
+          if (i % (bmp.width*4) != 0) blackPixel = !blackPixel
+          assert.deepEqual(Array.from(bmp.data.slice(i, i+4)),
+            blackPixel ? BLACK : WHITE
+          )
+        }
+      })
+
+      test("from Canvas", () => {
+        let blank = new Canvas()
+        ctx.fillStyle = ctx.createPattern(blank, 'repeat');
+        ctx.fillRect(0,0, 20,20);
+
+        let checkers = new Canvas(2, 2),
+            patCtx = checkers.getContext("2d");
+        patCtx.fillStyle = 'white';
+        patCtx.fillRect(0,0,2,2);
+        patCtx.fillStyle = 'black';
+        patCtx.fillRect(0,0,1,1);
+        patCtx.fillRect(1,1,1,1);
+
+        let pattern = ctx.createPattern(checkers, 'repeat')
+        ctx.fillStyle = pattern;
+        ctx.fillRect(0,0, 20,20);
+
+        let bmp = ctx.getImageData(0,0, 20,20)
+        let blackPixel = true
+        for (var i=0; i<bmp.data.length; i+=4){
+          if (i % (bmp.width*4) != 0) blackPixel = !blackPixel
+          assert.deepEqual(Array.from(bmp.data.slice(i, i+4)),
+            blackPixel ? BLACK : WHITE
+          )
+        }
+      })
+
+      test("with local transform", () => {
+        // call func with an ImageData-offset and pixel color value appropriate for a 4-quadrant pattern within
+        // the width and height that's white in the upper-left & lower-right and black in the other corners
+        function eachPixel(bmp, func){
+          let {width, height} = bmp;
+          for (let x=0; x<width; x++){
+            for (let y=0; y<height; y++){
+              let i = y*4*width + x*4,
+                  clr = (x<width/2 && y<height/2 || x>=width/2 && y>=height/2) ? 255 : 0;
+              func(i, clr);
+            }
+          }
+        }
+
+        // create a canvas with a single repeat of the pattern within its dims
+        function makeCheckerboard(w, h){
+          let check = new Canvas(w, h),
+              ctx = check.getContext('2d'),
+              bmp = ctx.createImageData(w, h);
+          eachPixel(bmp, (i, clr) => bmp.data.set([clr,clr,clr, 255], i));
+          ctx.putImageData(bmp, 0, 0);
+          return check;
+        }
+
+        // verify that the region looks like a single 4-quadrant checkerboard cell
+        function isCheckerboard(ctx, w, h){
+          let bmp = ctx.getImageData(0, 0, w, h);
+          eachPixel(bmp, (i, clr) => {
+            let px = Array.from(bmp.data.slice(i, i+4))
+            assert.deepEqual(px, [clr,clr,clr, 255])
+          })
+        }
+
+        let w = 160, h = 160,
+            pat = ctx.createPattern(makeCheckerboard(w, h), 'repeat'),
+            mat = new DOMMatrix();
+
+        ctx.fillStyle = pat;
+
+        // draw a single repeat of the pattern at each scale and then confirm that
+        // the transformation succeeded
+        [1, .5, .25, .125, 0.0625].forEach(mag => {
+          mat = new DOMMatrix().scale(mag);
+          pat.setTransform(mat);
+          // make sure the alternative matrix syntaxes also work
+          assert.doesNotThrow(() => {pat.setTransform(mag, 0, 0, mag, 0, 0)})
+          assert.doesNotThrow(() => {pat.setTransform([mag, 0, 0, mag, 0, 0])})
+          assert.doesNotThrow(() => {pat.setTransform({a:mag, b:0, c:0, d:mag, e:0, f:0})})
+          ctx.fillRect(0,0, w*mag, h*mag);
+          isCheckerboard(ctx, w*mag, h*mag);
+        })
+      })
+    })
+
+    describe("CanvasGradient", () => {
+      test("linear", () => {
+        let gradient = ctx.createLinearGradient(1,1,19,1);
+        ctx.fillStyle = gradient;
+        gradient.addColorStop(0,'#fff');
+        gradient.addColorStop(1,'#000');
+        ctx.fillRect(0,0,21,1);
+
+        assert.deepEqual(pixel(0,0), WHITE)
+        assert.deepEqual(pixel(20,0), BLACK)
+      })
+
+      test("radial", () => {
+        let [x, y, inside, outside] = [100, 100, 45, 55],
+            inner = /** @type {const} */ ([x, y, 25]),
+            outer = /** @type {const} */ ([x, y, 50]),
+            gradient = ctx.createRadialGradient(...inner, ...outer);
+        ctx.fillStyle = gradient
+        gradient.addColorStop(0,'#fff');
+        gradient.addColorStop(.5,'#000');
+        gradient.addColorStop(1,'#000');
+        gradient.addColorStop(1,'red');
+        ctx.fillRect(0,0, 200,200)
+
+        assert.deepEqual(pixel(x, y), WHITE)
+        assert.deepEqual(pixel(x+inside, y), BLACK)
+        assert.deepEqual(pixel(x, y+inside), BLACK)
+        assert.deepEqual(pixel(x+outside, y), [255,0,0,255])
+        assert.deepEqual(pixel(x, y+outside), [255,0,0,255])
+      })
+
+      test("conic", () => {
+        // draw a sweep with white at top and black on bottom
+        let gradient = ctx.createConicGradient(0, 256, 256);
+        ctx.fillStyle = gradient;
+        gradient.addColorStop(0,'#fff');
+        gradient.addColorStop(.5,'#000');
+        gradient.addColorStop(1,'#fff');
+        ctx.fillRect(0,0,512,512);
+
+        assert.deepEqual(pixel(5, 256), BLACK)
+        assert.deepEqual(pixel(500, 256), WHITE)
+
+        // rotate 90° so black is left and white is right
+        gradient = ctx.createConicGradient(Math.PI/2, 256, 256);
+        ctx.fillStyle = gradient;
+        gradient.addColorStop(0,'#fff');
+        gradient.addColorStop(.5,'#000');
+        gradient.addColorStop(1,'#fff');
+        ctx.fillRect(0,0,512,512);
+
+        assert.deepEqual(pixel(256, 500), WHITE)
+        assert.deepEqual(pixel(256, 5), BLACK)
+      })
+
+      test("dithering", () => {
+        // a shallow ramp spreads 17 levels over 256px, so undithered rows are identical bands
+        let g = ctx.createLinearGradient(0, 0, 256, 0)
+        g.addColorStop(0, '#000')
+        g.addColorStop(1, '#111')
+        ctx.fillStyle = g
+        let distinctRows = () => {
+          ctx.fillRect(0, 0, 256, 8)
+          let rows = Array.from({length:8}, (_, y) => Array.from(ctx.getImageData(0, y, 256, 1).data).join())
+          return new Set(rows).size
+        }
+
+        assert.equal(g.dithering, false)
+        assert.equal(distinctRows(), 1)
+
+        // takes effect even after the gradient has been assigned to fillStyle
+        g.dithering = true
+        assert.equal(g.dithering, true)
+        assert(distinctRows() > 1)
+
+        // @ts-expect-error — deliberately mistyped: exercises truthy coercion
+        g.dithering = 0
+        assert.equal(g.dithering, false)
+        assert.equal(distinctRows(), 1)
+      })
+
+      test("interpolation", () => {
+        // render a red→blue ramp and sample its midpoint under different interpolation settings
+        let midpoint = configure => {
+          let g = ctx.createLinearGradient(0, 0, WIDTH, 0)
+          if (configure) configure(g)
+          g.addColorStop(0, 'red')
+          g.addColorStop(1, 'blue')
+          ctx.fillStyle = g
+          ctx.fillRect(0, 0, WIDTH, HEIGHT)
+          return pixel(WIDTH/2, 0)
+        }
+
+        // the default (srgb) blends straight through RGB — a dim purple midpoint…
+        let base = midpoint(null)
+        assert(base[1] < 10 && base[0] > 100 && base[2] > 100, `expected a purple midpoint, got ${base}`)
+        assert.deepEqual(midpoint(g => g.colorInterpolationMethod = 'srgb'), base) // …explicit srgb is identical
+
+        // oklch takes the perceptually-uniform path: a more saturated magenta
+        let oklch = midpoint(g => g.colorInterpolationMethod = 'oklch')
+        assert(oklch[0] > base[0] && oklch[2] > base[2], `expected a more saturated midpoint, got ${oklch}`)
+
+        // …and `longer` hue interpolation sweeps the long way around the wheel, through green
+        let longWay = midpoint(g => { g.colorInterpolationMethod = 'oklch'; g.hueInterpolationMethod = 'longer' })
+        assert(longWay[1] === Math.max(...longWay.slice(0, 3)), `expected a green midpoint, got ${longWay}`)
+
+        // getters always report the current setting; defaults are the spec defaults
+        let probe = ctx.createLinearGradient(0, 0, 1, 0)
+        assert.deepEqual(
+          [probe.colorInterpolationMethod, probe.hueInterpolationMethod, probe.premultipliedAlpha],
+          ['srgb', 'shorter', false]
+        )
+        // @ts-expect-error — the type admits only canonical lowercase, but the parser is case-tolerant
+        probe.colorInterpolationMethod = 'OKLCH'
+        assert.equal(probe.colorInterpolationMethod, 'oklch')
+        probe.hueInterpolationMethod = 'increasing'
+        assert.equal(probe.hueInterpolationMethod, 'increasing')
+        probe.premultipliedAlpha = true
+        assert.equal(probe.premultipliedAlpha, true)
+
+        // premultiplied alpha keeps a fade-to-transparent from darkening through the transparent stop:
+        // non-premultiplied lerps the red channel toward 0 as alpha drops; premultiplied keeps it red
+        let fadeRed = premul => {
+          let g = ctx.createLinearGradient(0, 0, WIDTH, 0)
+          g.premultipliedAlpha = premul
+          g.addColorStop(0, 'red')
+          g.addColorStop(1, 'transparent')
+          ctx.clearRect(0, 0, WIDTH, HEIGHT)
+          ctx.fillStyle = g
+          ctx.fillRect(0, 0, WIDTH, HEIGHT)
+          return pixel(WIDTH/2, 0)[0]
+        }
+        assert(fadeRed(true) > fadeRed(false), 'premultiplied should keep the midpoint red channel brighter')
+
+        // unknown values throw (also compile-time errors under the strict property types, hence the pragmas)
+        // @ts-expect-error
+        assert.throws(() => probe.colorInterpolationMethod = 'bogus', /Unsupported colorInterpolationMethod/)
+        // @ts-expect-error
+        assert.throws(() => probe.hueInterpolationMethod = 'sideways', /Unsupported hueInterpolationMethod/)
+      })
+    })
+
+    describe("CanvasTexture", () => {
+      var waves, nylon, lines
+
+      beforeEach(() => {
+        let w = 40
+        let wavePath = new Path2D()
+        wavePath.moveTo(-w/2, w/2)
+        wavePath.bezierCurveTo(-w*3/8, w*3/4, -w/8, w*3/4, 0, w/2)
+        wavePath.bezierCurveTo(w/8, w/4, w*3/8, w/4, w/2, w/2)
+        wavePath.bezierCurveTo(w*5/8, w*3/4, w*7/8, w*3/4, w, w/2)
+        wavePath.bezierCurveTo(w*9/8, w/4, w*11/8, w/4, w*3/2, w/2)
+        waves = ctx.createTexture([w, w/2], {path:wavePath, color:'black', line:3, angle:Math.PI/7})
+
+        let n = 50
+        let nylonPath = new Path2D()
+        nylonPath.moveTo(0,     n/4)
+        nylonPath.lineTo(n/4,   n/4)
+        nylonPath.lineTo(n/4,   0)
+        nylonPath.moveTo(n*3/4, n)
+        nylonPath.lineTo(n*3/4, n*3/4)
+        nylonPath.lineTo(n,     n*3/4)
+        nylonPath.moveTo(n/4,   n/2)
+        nylonPath.lineTo(n/4,   n*3/4)
+        nylonPath.lineTo(n/2,   n*3/4)
+        nylonPath.moveTo(n/2,   n/4)
+        nylonPath.lineTo(n*3/4, n/4)
+        nylonPath.lineTo(n*3/4, n/2)
+        nylon = ctx.createTexture(n, {path:nylonPath, color:'black', line:5, cap:'square', angle:Math.PI/8})
+
+        lines = ctx.createTexture(8, {line:4, color:'black'})
+      })
+
+      test("with filled Path2D", async () => {
+        ctx.fillStyle = nylon
+        ctx.fillRect(10, 10, 80, 80)
+
+        assert.deepEqual(pixel(26, 24), CLEAR)
+        assert.deepEqual(pixel(28, 26), BLACK)
+        assert.deepEqual(pixel(48, 48), BLACK)
+        assert.deepEqual(pixel(55, 40), CLEAR)
+      })
+
+      test("with stroked Path2D", async () => {
+        ctx.strokeStyle = waves
+        ctx.lineWidth = 10
+        ctx.moveTo(0,0)
+        ctx.lineTo(100, 100)
+        ctx.stroke()
+
+        assert.deepEqual(pixel(10, 10), CLEAR)
+        assert.deepEqual(pixel(16, 16), BLACK)
+        assert.deepEqual(pixel(73, 73), BLACK)
+        assert.deepEqual(pixel(75, 75), CLEAR)
+      })
+
+      test("with lines", async () => {
+        ctx.fillStyle = lines
+        ctx.fillRect(10, 10, 80, 80)
+
+        assert.deepEqual(pixel(22, 22), CLEAR)
+        assert.deepEqual(pixel(25, 25), BLACK)
+        assert.deepEqual(pixel(73, 73), CLEAR)
+        assert.deepEqual(pixel(76, 76), BLACK)
+      })
+
+      test("with offset Path2D", async () => {
+        // each tile is drawn 50px from its cell's center, so the first row & column come from cells outside the rect
+        let dot = new Path2D()
+        dot.rect(50, 50, 6, 6)
+        ctx.fillStyle = ctx.createTexture(20, {path:dot, color:'black'})
+        ctx.fillRect(10, 10, 80, 80)
+
+        assert.deepEqual(pixel(23, 23), BLACK)
+        assert.deepEqual(pixel(43, 23), BLACK)
+        assert.deepEqual(pixel(23, 63), BLACK)
+        assert.deepEqual(pixel(30, 30), CLEAR)
+      })
+    })
+  })
+
+  describe("supports", () => {
+
+    test("filter", () => {
+      // results differ b/t cpu & gpu renderers so make sure test doesn't fail if gpu support isn't present
+      let {gpu} = canvas
+      canvas.gpu = false
+      // make sure chains of filters compose correctly <https://codepen.io/sosuke/pen/Pjoqqp>
+      ctx.filter = 'blur(5px) invert(56%) sepia(63%) saturate(4837%) hue-rotate(163deg) brightness(96%) contrast(101%)'
+      ctx.fillRect(0,0,20,20)
+      assert.deepEqual(pixel(10, 10), [0, 162, 213, 245])
+      canvas.gpu = gpu
+
+      // an invalid term drops the entire declaration and keeps the prior filter — matching CSS
+      // (and `font`/`fontVariant`) rather than salvaging the valid terms
+      ctx.filter = 'blur(2px)'
+      assert.equal(ctx.filter, 'blur(2px)')
+      ctx.filter = 'blur(4px) garbage(3)'
+      assert.equal(ctx.filter, 'blur(2px)')
+      // junk glued to a valid function (no space) is likewise invalid: browsers parse `filter` as
+      // a token list, so leading/trailing/embedded junk drops the whole value rather than letting
+      // the valid substring through
+      for (let junk of ['blur(4px)junk', 'junkblur(4px)', 'xblur(4px)', 'blur(4px)!!!']){
+        ctx.filter = junk
+        assert.equal(ctx.filter, 'blur(2px)', `"${junk}" should be rejected whole`)
+      }
+      // a fully-valid chain still applies, and `none` still resets
+      ctx.filter = 'blur(4px) invert(50%)'
+      assert.equal(ctx.filter, 'blur(4px) invert(50%)')
+      ctx.filter = 'none'
+      assert.equal(ctx.filter, 'none')
+
+      // newlines are ordinary whitespace, including inside a function's parens
+      ctx.filter = 'blur(\n4px\n)\ndrop-shadow(1px\n2px\nred)'
+      assert.equal(ctx.filter, 'blur(4px) drop-shadow(1px 2px red)')
+      ctx.filter = 'none'
+
+      // a unitless zero is a valid <length> even though every other number needs a unit
+      ctx.filter = 'drop-shadow(20px 20px 0 red)'
+      assert.equal(ctx.filter, 'drop-shadow(20px 20px 0 red)')
+      ctx.filter = 'blur(0)'
+      assert.equal(ctx.filter, 'blur(0)')
+      ctx.filter = 'drop-shadow(20px 20px 1 red)' // …but a non-zero one still doesn't
+      assert.equal(ctx.filter, 'blur(0)')
+
+      // bare numbers (for percentage-valued functions) follow the same digits-only grammar as
+      // lengths: no exponents and no JS-isms like hex (which used to be silently read as 0)
+      ctx.filter = 'opacity(.5)'
+      assert.equal(ctx.filter, 'opacity(.5)')
+      for (let junk of ['opacity(1e2)', 'opacity(0x10)', 'opacity(5.)']){
+        ctx.filter = junk
+        assert.equal(ctx.filter, 'opacity(.5)', `"${junk}" should be rejected`)
+      }
+
+      // negative values invalidate the whole chain, except for hue-rotate angles & shadow offsets
+      for (let neg of ['blur(-5px)', 'sepia(-1)', 'brightness(-50%)', 'drop-shadow(1px 1px -5px red)', 'blur(2px) opacity(-1)']){
+        ctx.filter = neg
+        assert.equal(ctx.filter, 'opacity(.5)', `"${neg}" should be rejected`)
+      }
+      ctx.filter = 'hue-rotate(-90deg) drop-shadow(-1px -2px 3px red)'
+      assert.equal(ctx.filter, 'hue-rotate(-90deg) drop-shadow(-1px -2px 3px red)')
+      ctx.filter = 'blur(0)'
+
+      // an unparseable drop-shadow color invalidates the whole declaration rather than
+      // dropping just the shadow (which would leave `filter` describing a no-op)
+      ctx.filter = 'drop-shadow(10px 10px 5px bogusColor)'
+      assert.equal(ctx.filter, 'blur(0)')
+
+      // a unitless zero is also a valid <angle> in hue-rotate()
+      ctx.filter = 'hue-rotate(0)'
+      assert.equal(ctx.filter, 'hue-rotate(0)')
+      ctx.filter = 'hue-rotate(1)' // …but a bare number still isn't
+      assert.equal(ctx.filter, 'hue-rotate(0)')
+
+      // whitespace is allowed inside the parens, not just around the terms
+      ctx.filter = 'blur( 5px )'
+      assert.equal(ctx.filter, 'blur(5px)')
+      ctx.filter = 'drop-shadow( 1px 1px 1px red )'
+      assert.equal(ctx.filter, 'drop-shadow(1px 1px 1px red)')
+
+      // drop-shadow()'s grammar is `<color>? && <length>{2,3}`: the blur radius is optional and
+      // the color may lead or trail the lengths
+      for (let spec of ['drop-shadow(10px 10px)', 'drop-shadow(10px 10px red)',
+                        'drop-shadow(red 10px 10px)', 'drop-shadow(red 10px 10px 5px)',
+                        'drop-shadow(rgb(0 0 0 / 50%) 1px 1px)']){
+        ctx.filter = spec
+        assert.equal(ctx.filter, spec)
+      }
+      // …but not 1 or 4 lengths, two colors, or a color splitting the run of lengths
+      ctx.filter = 'blur(2px)'
+      for (let junk of ['drop-shadow(10px)', 'drop-shadow(1px 2px 3px 4px)', 'drop-shadow()',
+                        'drop-shadow(red blue 1px 1px)', 'drop-shadow(10px red 10px)',
+                        'drop-shadow(1px 1px medium)']){
+        ctx.filter = junk
+        assert.equal(ctx.filter, 'blur(2px)', `"${junk}" should be rejected whole`)
+      }
+
+      // per spec, non-string values are unparseable and leave the filter untouched
+      for (let bad of [null, undefined, 5, {}, []]){
+        // @ts-expect-error — deliberately invalid assignment
+        ctx.filter = bad
+        assert.equal(ctx.filter, 'blur(2px)')
+      }
+
+      // junk *inside* a function's parens is no more valid than junk glued outside it
+      ctx.filter = 'blur(2px)'
+      for (let junk of ['blur(4pxjunk)', 'blur(1.2.3px)', 'blur(5.px)', 'hue-rotate(abc90deg)',
+                        'hue-rotate(90degjunk)', 'drop-shadow(10pxjunk 10px red)']){
+        ctx.filter = junk
+        assert.equal(ctx.filter, 'blur(2px)', `"${junk}" should be rejected whole`)
+      }
+
+      // a leading sign is part of the number, not junk
+      ctx.filter = 'blur(+4px)'
+      assert.equal(ctx.filter, 'blur(+4px)')
+
+      // percentages may be fractional (they were integer-only, and parsed with parseInt)
+      ctx.filter = 'opacity(12.5%) saturate(150.5%)'
+      assert.equal(ctx.filter, 'opacity(12.5%) saturate(150.5%)')
+      assert.nearEqual(css.filter('opacity(12.5%)').filters['opacity'], 0.125)
+      assert.nearEqual(css.filter('sepia(.5%)').filters['sepia'], 0.005)
+
+      // …and hue-rotate's sign is honored: it used to be dropped, making ±90° identical
+      let hued = deg => {
+        ctx.filter = 'none'
+        ctx.clearRect(0, 0, WIDTH, HEIGHT)
+        ctx.filter = `hue-rotate(${deg}deg)`
+        ctx.fillStyle = 'red'
+        ctx.fillRect(0, 0, 20, 20)
+        return pixel(10, 10)
+      }
+      assert.notDeepEqual(hued(-90), hued(90))
+
+      // an omitted drop-shadow color means opaque black
+      ctx.filter = 'none'
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.filter = 'drop-shadow(40px 40px)'
+      ctx.fillStyle = 'white'
+      ctx.fillRect(10, 10, 20, 20)
+      assert.deepEqual(pixel(60, 60), BLACK)
+      ctx.filter = 'none'
+    })
+
+    test("filter with em lengths", () => {
+      // like browsers, `em` resolves against the font size in effect when the filter is set
+      let blurred = (setup) => {
+        ctx.reset()
+        setup()
+        ctx.fillRect(20, 20, 20, 20)
+        return ctx.getImageData(0, 0, 60, 60).data
+      }
+      let blur4 = blurred(() => ctx.filter = 'blur(4px)'),
+          blur1 = blurred(() => ctx.filter = 'blur(1px)')
+      assert.notDeepEqual(blur4, blur1)
+
+      assert.deepEqual(blurred(() => { ctx.font = '40px serif'; ctx.filter = 'blur(0.1em)' }), blur4)
+      assert.deepEqual(blurred(() => { ctx.filter = 'blur(1em)' }), blurred(() => ctx.filter = 'blur(10px)')) // default font
+
+      // a later font change doesn't affect it, but re-assigning the same string re-resolves it
+      assert.deepEqual(blurred(() => { ctx.font = '40px serif'; ctx.filter = 'blur(0.1em)'; ctx.font = '10px serif' }), blur4)
+      assert.deepEqual(blurred(() => {
+        ctx.font = '40px serif'; ctx.filter = 'blur(0.1em)'; ctx.font = '10px serif'; ctx.filter = 'blur(0.1em)'
+      }), blur1)
+
+      // percentages & size keywords aren't <length>s
+      ctx.filter = 'blur(1em)'
+      for (let bad of ['blur(10%)', 'blur(small)', 'drop-shadow(1px 1px 10% red)']){
+        ctx.filter = bad
+        assert.equal(ctx.filter, 'blur(1em)', `"${bad}" should be rejected`)
+      }
+    })
+
+    test('shadow', async() => {
+      const sin = Math.sin(1.15*Math.PI)
+      const cos = Math.cos(1.15*Math.PI)
+      ctx.translate(150, 150)
+      ctx.transform(cos, sin, -sin, cos, 0, 0)
+
+      ctx.shadowColor = '#000'
+      ctx.shadowBlur = 5
+      ctx.shadowOffsetX = 10
+      ctx.shadowOffsetY = 10
+      ctx.fillStyle = '#eee'
+      ctx.fillRect(25, 25, 65, 10)
+
+      // ensure that the shadow is actually fuzzy despite the transforms
+      assert.notEqual(pixel(143, 117), BLACK)
+    })
+
+    test("globalCompositeOperation", () => {
+      let RED = [255,0,0,255],
+          BLUE = [0,0,255,255],
+          MAGENTA = [255,0,255,255]
+      let dstOnly = () => pixel(40, 40),
+          overlap = () => pixel(100, 100),
+          srcOnly = () => pixel(160, 160)
+
+      let compose = op => {
+        canvas.width = WIDTH
+        ctx.fillStyle = '#f00'
+        ctx.fillRect(20, 20, 100, 100)
+        ctx.globalCompositeOperation = op
+        ctx.fillStyle = '#00f'
+        ctx.fillRect(80, 80, 100, 100)
+      }
+
+      compose('source-over')
+      assert.deepEqual(dstOnly(), RED)
+      assert.deepEqual(overlap(), BLUE)
+      assert.deepEqual(srcOnly(), BLUE)
+
+      compose('destination-over')
+      assert.deepEqual(dstOnly(), RED)
+      assert.deepEqual(overlap(), RED)
+      assert.deepEqual(srcOnly(), BLUE)
+
+      compose('source-in')
+      assert.deepEqual(dstOnly(), CLEAR)
+      assert.deepEqual(overlap(), BLUE)
+      assert.deepEqual(srcOnly(), CLEAR)
+
+      compose('destination-out')
+      assert.deepEqual(dstOnly(), RED)
+      assert.deepEqual(overlap(), CLEAR)
+      assert.deepEqual(srcOnly(), CLEAR)
+
+      compose('xor')
+      assert.deepEqual(dstOnly(), RED)
+      assert.deepEqual(overlap(), CLEAR)
+      assert.deepEqual(srcOnly(), BLUE)
+
+      compose('copy')
+      assert.deepEqual(dstOnly(), CLEAR)
+      assert.deepEqual(overlap(), BLUE)
+      assert.deepEqual(srcOnly(), BLUE)
+
+      // blend-mode results are computable from the source & destination channels
+      compose('multiply')
+      assert.deepEqual(overlap(), [0,0,0,255])
+
+      compose('lighter')
+      assert.deepEqual(overlap(), MAGENTA)
+
+      compose('screen')
+      assert.deepEqual(overlap(), MAGENTA)
+    })
+
+    test("setLineDash()", () => {
+      let runsAcross = y => {
+        let row = ctx.getImageData(0, y, WIDTH, 1).data,
+            runs = 0,
+            prev = false
+        for (let x = 0; x < WIDTH; x++){
+          let ink = row[x*4 + 3] > 128
+          if (ink && !prev) runs++
+          prev = ink
+        }
+        return runs
+      }
+
+      let dashedLine = y => {
+        ctx.beginPath()
+        ctx.moveTo(50, y)
+        ctx.lineTo(350, y)
+        ctx.stroke()
+      }
+
+      ctx.lineWidth = 4
+      ctx.setLineDash([20, 20])
+      dashedLine(100)
+      assert.deepEqual(pixel(55, 100), BLACK)
+      assert.deepEqual(pixel(75, 100), CLEAR)
+      assert.equal(runsAcross(100), 8)
+
+      // lineDashOffset shifts the phase
+      ctx.lineDashOffset = 20
+      assert.equal(ctx.lineDashOffset, 20)
+      dashedLine(200)
+      assert.deepEqual(pixel(55, 200), CLEAR)
+      assert.deepEqual(pixel(75, 200), BLACK)
+      assert.equal(runsAcross(200), 7)
+    })
+
+    test("lineDashMarker", () => {
+      assert.equal(ctx.lineDashMarker, null)
+      let marker = new Path2D()
+      marker.rect(-4, -4, 8, 8)
+      ctx.lineDashMarker = marker
+      assert.equal(ctx.lineDashMarker.d, marker.d)
+
+      // markers are stamped at each dash interval in place of the dash pattern
+      ctx.setLineDash([50])
+      ctx.beginPath()
+      ctx.moveTo(50, 300)
+      ctx.lineTo(350, 300)
+      ctx.stroke()
+      assert.deepEqual(pixel(50, 300), BLACK)
+      assert.deepEqual(pixel(100, 300), BLACK)
+      assert.deepEqual(pixel(75, 300), CLEAR)
+
+      ctx.lineDashMarker = null
+      assert.equal(ctx.lineDashMarker, null)
+
+      // lineDashFit accepts its enum & ignores unknown values
+      assert.equal(ctx.lineDashFit, 'turn')
+      for (let fit of /** @type {const} */ (['move', 'turn', 'follow'])){
+        ctx.lineDashFit = fit
+        assert.equal(ctx.lineDashFit, fit)
+      }
+      // @ts-expect-error — deliberately invalid enum value
+      ctx.lineDashFit = 'bogus'
+      assert.equal(ctx.lineDashFit, 'follow')
+    })
+
+    test("clip()", () => {
+      ctx.fillStyle = 'white'
+      ctx.fillRect(0, 0, 2, 2)
+
+      // overlapping rectangles to use as a clipping mask
+      ctx.rect(0, 0, 2, 1)
+      ctx.rect(1, 0, 1, 2)
+
+      // b | w
+      // -----
+      // w | b
+      ctx.save()
+      ctx.clip('evenodd')
+      ctx.fillStyle = 'black'
+      ctx.fillRect(0, 0, 2, 2)
+      ctx.restore()
+
+      assert.deepEqual(pixel(0, 0), BLACK)
+      assert.deepEqual(pixel(1, 0), WHITE)
+      assert.deepEqual(pixel(0, 1), WHITE)
+      assert.deepEqual(pixel(1, 1), BLACK)
+
+      // b | b
+      // -----
+      // w | b
+      ctx.save()
+      ctx.clip() // nonzero
+      ctx.fillStyle = 'black'
+      ctx.fillRect(0, 0, 2, 2)
+      ctx.restore()
+
+      assert.deepEqual(pixel(0, 0), BLACK)
+      assert.deepEqual(pixel(1, 0), BLACK)
+      assert.deepEqual(pixel(0, 1), WHITE)
+      assert.deepEqual(pixel(1, 1), BLACK)
+
+      // test intersection of sequential clips while incorporating transform
+      ctx.fillStyle = 'black'
+      ctx.fillRect(0,0,WIDTH,HEIGHT)
+
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(20,20,60,60)
+      ctx.clip()
+      ctx.fillStyle = 'white'
+      ctx.fillRect(0,0,WIDTH,HEIGHT)
+
+      ctx.beginPath()
+      ctx.translate(20, 20)
+      ctx.rect(0,0,30,30)
+      ctx.clip()
+      ctx.fillStyle = 'green'
+      ctx.fillRect(0,0,WIDTH,HEIGHT)
+      ctx.restore()
+
+      assert.deepEqual(pixel(10, 10), BLACK)
+      assert.deepEqual(pixel(90, 90), BLACK)
+      assert.deepEqual(pixel(22, 22), GREEN)
+      assert.deepEqual(pixel(48, 48), GREEN)
+      assert.deepEqual(pixel(52, 52), WHITE)
+
+      // non-overlapping clips & empty clips should prevent drawing altogether
+      ctx.beginPath()
+      ctx.rect(20,20,30,30)
+      ctx.clip()
+      ctx.fillStyle = 'black'
+      ctx.fillRect(0,0,WIDTH,HEIGHT)
+
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(25,25,0,0)
+      ctx.clip()
+      ctx.fillStyle = 'green'
+      ctx.fillRect(0,0,WIDTH,HEIGHT)
+      ctx.restore()
+
+      ctx.save()
+      ctx.beginPath()
+      ctx.rect(0,0,10,10)
+      ctx.clip()
+      ctx.fillStyle = 'green'
+      ctx.fillRect(0,0,WIDTH,HEIGHT)
+      ctx.restore()
+
+      assert.deepEqual(pixel(30, 30), BLACK)
+    })
+
+    test("fill()", () => {
+      ctx.fillStyle = 'white'
+      ctx.fillRect(0, 0, 2, 2)
+
+      // set the current path to a pair of overlapping rects
+      ctx.fillStyle = 'black'
+      ctx.rect(0, 0, 2, 1)
+      ctx.rect(1, 0, 1, 2)
+
+      // b | w
+      // -----
+      // w | b
+      ctx.fill('evenodd')
+      assert.deepEqual(pixel(0, 0), BLACK)
+      assert.deepEqual(pixel(1, 0), WHITE)
+      assert.deepEqual(pixel(0, 1), WHITE)
+      assert.deepEqual(pixel(1, 1), BLACK)
+
+      // b | b
+      // -----
+      // w | b
+      ctx.fill() // nonzero
+      assert.deepEqual(pixel(0, 0), BLACK)
+      assert.deepEqual(pixel(1, 0), BLACK)
+      assert.deepEqual(pixel(0, 1), WHITE)
+      assert.deepEqual(pixel(1, 1), BLACK)
+    })
+
+    test("fillText()", () => {
+      /** @type {[args: any[], shouldDraw: boolean][]} */
+      let argsets = [
+        [['A', 10, 10], true],
+        [['A', 10, 10, undefined], true],
+        [['A', 10, 10, NaN], false],
+        [['A', 10, 10, Infinity], false],
+        [[1234, 10, 10], true],
+        [[false, 10, 10], true],
+        [[{}, 10, 10], true],
+      ]
+
+      _each(argsets, ([args, shouldDraw]) => {
+        canvas.width = WIDTH
+        ctx.textBaseline = 'middle'
+        ctx.textAlign = 'center'
+        // @ts-expect-error — the argset rows mix arities/types on purpose
+        ctx.fillText(...args)
+        assert.equal(ctx.getImageData(0, 0, 20, 20).data.some(a => a), shouldDraw)
+      })
+
+      // baseline metrics resolve without an explicit font: reset to clear the state above (still the
+      // implicit default), then 'top' drops glyphs below the origin while 'bottom' lifts them above —
+      // so 'top' ink lands well below 'bottom' ink
+      let topAt = baseline => {
+        canvas.width = WIDTH
+        ctx.textBaseline = baseline
+        ctx.fillText('Mg', 20, 100)
+        let {data} = ctx.getImageData(0, 0, WIDTH, HEIGHT)
+        for (let y=0; y<HEIGHT; y++)
+          for (let x=0; x<WIDTH; x++)
+            if (data[(y*WIDTH + x)*4 + 3] > 0) return y
+        return null
+      }
+      let top = topAt('top'), bottom = topAt('bottom')
+      assert(top != null && bottom != null, "expected text to render for both baselines")
+      assert(top > bottom + 4, `expected 'top' baseline ink (${top}) below 'bottom' (${bottom})`)
+
+      // glyphs draw at their exact fractional baseline, not snapped to the pixel grid the way
+      // skparagraph's paint() did. A 10x vertical scale magnifies any leftover sub-pixel snap into
+      // whole device rows: 'E' has a flat bottom on the baseline, so shifting the user-space baseline
+      // by half a pixel must move the device ink ~5 rows. The *shift* is the assertion rather than an
+      // absolute row because each font's bottom overshoot already lands the ink a row or two off on
+      // its own (and by a different amount per rasterizer), while the shift cancels that out. The old
+      // snap rounded both renders onto the same row, leaving a delta of 0.
+      FontLibrary.use('TestFace', [`tests/assets/fonts/montserrat-latin/montserrat-v30-latin-regular.woff2`])
+      let inkBottom = draw => {
+        const W = 120, H = 400
+        const c = new Canvas(W, H), cx = c.getContext('2d')
+        cx.fillStyle = 'white'; cx.fillRect(0, 0, W, H)
+        cx.fillStyle = 'black'; cx.textBaseline = 'alphabetic'
+        draw(cx)
+        const {data} = cx.getImageData(0, 0, W, H)
+        let row = -1
+        for (let y = 0; y < H; y++) for (let px = 0; px < W; px++){
+          const i = (y*W + px) * 4
+          if (data[i] < 128 && data[i+3] > 128){ row = y; break }
+        }
+        return row
+      }
+      let bottomAt = uy => inkBottom(cx => { cx.font = '40px TestFace'; cx.scale(1, 10); cx.fillText('E', 4, uy) })
+      let flush = bottomAt(20), nudged = bottomAt(20.5)
+      assert(Math.abs(flush - 200) <= 4, `expected the baseline near 200, got ${flush}`)
+      assert(Math.abs((nudged - flush) - 5) <= 1,
+        `a half-pixel baseline shift should move the ink ~5 device rows, got ${nudged - flush}`)
+    })
+
+    test("strokeText()", () => {
+      FontLibrary.use(`tests/assets/fonts/Monoton-Regular.woff`)
+      let inked = () => ctx.getImageData(0, 0, WIDTH, HEIGHT).data.filter((v, i) => i % 4 == 3 && v > 128).length
+
+      ctx.font = '80px Monoton'
+      ctx.strokeText('O', 50, 120)
+      let stroked = inked()
+      assert(stroked > 0)
+
+      // filling the same glyph covers more area than stroking its outline
+      canvas.width = WIDTH
+      ctx.font = '80px Monoton'
+      ctx.fillText('O', 50, 120)
+      assert(inked() > stroked)
+    })
+
+    test("outlineText()", () => {
+      // outlineText resolves baseline metrics on the implicit default font (no ctx.font set)
+      ctx.textBaseline = 'top'
+      let topPath = ctx.outlineText('Mg')
+      ctx.textBaseline = 'bottom'
+      let bottomPath = ctx.outlineText('Mg')
+      assert(topPath && bottomPath, "expected outlineText to return a path for both baselines")
+      assert(topPath.bounds.top > bottomPath.bounds.top + 4,
+        `expected 'top' outline (${topPath.bounds.top}) below 'bottom' (${bottomPath.bounds.top})`)
+    })
+
+    test("roundRect()", () => {
+      let dim = WIDTH/2
+      let radii = [50, 25, {x:15, y:15}, new DOMPoint(20, 10)]
+      ctx.beginPath()
+      ctx.roundRect(dim, dim, dim, dim, radii)
+      ctx.roundRect(dim, dim, -dim, -dim, radii)
+      ctx.roundRect(dim, dim, -dim, dim, radii)
+      ctx.roundRect(dim, dim, dim, -dim, radii)
+      ctx.fill()
+
+      let off = [ [3,3], [dim-14, dim-14], [dim-4, 3], [7, dim-6]]
+      let on = [ [5,5], [dim-17, dim-17], [dim-9, 3], [9, dim-9] ]
+
+      for (const [x, y] of on){
+        assert.deepEqual(pixel(x, y), BLACK)
+        assert.deepEqual(pixel(x, HEIGHT - y - 1), BLACK)
+        assert.deepEqual(pixel(WIDTH - x - 1, y), BLACK)
+        assert.deepEqual(pixel(WIDTH - x - 1, HEIGHT - y - 1), BLACK)
+      }
+
+      for (const [x, y] of off){
+        assert.deepEqual(pixel(x, y), CLEAR)
+        assert.deepEqual(pixel(x, HEIGHT - y - 1), CLEAR)
+        assert.deepEqual(pixel(WIDTH - x - 1, y), CLEAR)
+        assert.deepEqual(pixel(WIDTH - x - 1, HEIGHT - y - 1), CLEAR)
+      }
+
+      // the next segment starts from the (x, y) corner, not where the rounded outline began
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.beginPath()
+      ctx.roundRect(10, 10, 30, 30, 10)
+      ctx.lineTo(10, 90)
+      ctx.lineWidth = 2
+      ctx.stroke()
+      assert.deepEqual(pixel(10, 12), BLACK)
+    })
+
+    test('getImageData()', () => {
+      ctx.fillStyle = 'rgba(255,0,0, 0.25)'
+      ctx.fillRect(0,0,1,6)
+
+      ctx.fillStyle = 'rgba(0,255,0, 0.5)'
+      ctx.fillRect(1,0,1,6)
+
+      ctx.fillStyle = 'rgba(0,0,255, 0.75)'
+      ctx.fillRect(2,0,1,6)
+
+      let [width, height] = [3, 6],
+          bmp1 = ctx.getImageData(0,0, width,height),
+          bmp2 = ctx.getImageData(width,height,-width,-height) // negative dimensions shift origin
+      for (const bmp of [bmp1, bmp2]){
+        assert.equal(bmp.width, width)
+        assert.equal(bmp.height, height)
+        assert.equal(bmp.data.length, width * height * 4)
+        assert.deepEqual(Array.from(bmp.data.slice(0,4)), [255,0,0,64])
+        assert.deepEqual(Array.from(bmp.data.slice(4,8)), [0,255,0,128])
+        assert.deepEqual(Array.from(bmp.data.slice(8,12)), [0,0,255,191])
+        for(var x=0; x<width; x++){
+          for(var y=0; y<height; y++){
+            let i = 4 * (y*width + x)
+            let px = Array.from(bmp.data.slice(i,i+4))
+            assert.deepEqual(pixel(x,y), px)
+          }
+        }
+      }
+
+      // per spec every coordinate is `[EnforceRange] long`, so fractional values truncate toward
+      // zero (not floor) and out-of-int32 values are a TypeError. truncation, not floor: sx of
+      // -0.5 reads from 0 (in bounds), -1 reads out of bounds
+      ctx.reset()
+      ctx.fillStyle = 'red'
+      ctx.fillRect(0, 0, 4, 4)
+      assert.equal(ctx.getImageData(-0.5, 0, 2, 1).data[3], 255)
+      assert.equal(ctx.getImageData(-1, 0, 2, 1).data[3], 0)
+
+      // dimensions are truncated before being scaled by `density`, so the buffer the rust side
+      // allocates always matches the ImageData it's wrapped in
+      assert.deepEqual([10, 10, 400], (d => [d.width, d.height, d.data.length])(ctx.getImageData(0, 0, 10.7, 10.7)))
+      assert.deepEqual([20, 20, 1600], (d => [d.width, d.height, d.data.length])(ctx.getImageData(0, 0, 10.7, 10.7, {density: 2})))
+      assert.deepEqual([3, 1], (d => [d.width, d.height])(ctx.getImageData(5, 0, -3.7, 1)))
+
+      assert.throws(() => ctx.getImageData(1e12, 0, 10, 10), /Expected an integer for `sx`/)
+
+      // the `colorSpace` option converts on read (and putImageData converts back)
+      canvas.width = WIDTH
+      ctx.fillStyle = '#f00'
+      ctx.fillRect(0, 0, 4, 4)
+      // srgb is the default and reads back unconverted
+      let srgb = ctx.getImageData(0, 0, 1, 1)
+      assert.equal(srgb.colorSpace, 'srgb')
+      assert.deepEqual(Array.from(srgb.data), [255, 0, 0, 255])
+      // sRGB red sits inside display-p3's wider gamut, so its converted coordinates pull in from the edge
+      let p3 = ctx.getImageData(0, 0, 1, 1, {colorSpace:'display-p3'})
+      assert.equal(p3.colorSpace, 'display-p3')
+      assert.deepEqual(Array.from(p3.data), [234, 51, 35, 255])
+      // …and putting the converted bitmap back onto the (srgb) canvas converts it home again
+      ctx.putImageData(p3, 4, 0)
+      let [r, g, b, a] = pixel(4, 0)
+      assert.ok(Math.abs(r - 255) <= 1 && g <= 1 && b <= 1 && a == 255)
+    })
+
+    test('putImageData()', () => {
+      // @ts-expect-error — deliberately not an ImageData
+      assert.throws(() => ctx.putImageData({}, 0, 0))
+      assert.throws(() => ctx.putImageData(undefined, 0, 0))
+
+      var srcImageData = ctx.createImageData(2,2)
+      srcImageData.data.set([
+        1,2,3,255, 5,6,7,255,
+        0,1,2,255, 4,5,6,255
+      ], 0)
+
+      ctx.putImageData(srcImageData, -1, -1);
+      var resImageData = ctx.getImageData(0, 0, 2, 2);
+      assert.deepEqual(Array.from(resImageData.data), [
+        4,5,6,255, 0,0,0,0,
+        0,0,0,0,   0,0,0,0
+      ])
+
+      // try mask rect
+      ctx.reset()
+      ctx.putImageData(srcImageData, 0, 0, 1, 1, 1, 1);
+      resImageData = ctx.getImageData(0, 0, 2, 2);
+      assert.deepEqual(Array.from(resImageData.data), [
+        0,0,0,0, 0,0,0,0,
+        0,0,0,0, 4,5,6,255
+      ])
+
+      // try negative dimensions
+      ctx.reset()
+      ctx.putImageData(srcImageData, 0, 0, 1, 1, -1, -1);
+      resImageData = ctx.getImageData(0, 0, 2, 2);
+      assert.deepEqual(Array.from(resImageData.data), [
+        1,2,3,255, 0,0,0,0,
+        0,0,0,0,   0,0,0,0
+      ])
+
+      // per spec every coordinate is `[EnforceRange] long`, so fractional values truncate toward
+      // zero (not floor) and out-of-int32 values are a TypeError
+      let dot = ctx.createImageData(1, 1)
+      dot.data.set([255, 0, 0, 255], 0)
+
+      for (const [dx, landsAt] of [[10, 10], [10.5, 10], [10.9, 10], [-0.5, 0]]){
+        ctx.reset()
+        ctx.putImageData(dot, dx, 0)
+        assert.deepEqual(pixel(landsAt, 0), [255, 0, 0, 255], `putImageData(dx=${dx})`)
+      }
+
+      // the dirty rect truncates the same way
+      ctx.reset()
+      let quad = ctx.createImageData(2, 2)
+      quad.data.set([1,2,3,255, 5,6,7,255, 0,1,2,255, 4,5,6,255], 0)
+      ctx.putImageData(quad, 0, 0, 1.9, 1.9, 1, 1)
+      assert.deepEqual(pixel(1, 1), [4, 5, 6, 255])
+
+      assert.throws(() => ctx.putImageData(dot, 1e12, 0), /Expected an integer for `dx`/)
+    })
+
+    test("isPointInPath()", () => {
+      let inStroke = /** @type {const} */ ([100, 94]),
+          inFill = /** @type {const} */ ([150, 150]),
+          inBoth = /** @type {const} */ ([100, 100]);
+
+      ctx.rect(100,100,100,100)
+      ctx.lineWidth = 12
+
+      assert.equal(ctx.isPointInPath(...inStroke), false)
+      assert.equal(ctx.isPointInStroke(...inStroke), true)
+
+      assert.equal(ctx.isPointInPath(...inFill), true)
+      assert.equal(ctx.isPointInStroke(...inFill), false)
+
+      assert.equal(ctx.isPointInPath(...inBoth), true)
+      assert.equal(ctx.isPointInStroke(...inBoth), true)
+
+      // nothing is hit while the transform is singular
+      ctx.scale(0, 0)
+      assert.equal(ctx.isPointInPath(...inFill), false)
+      assert.equal(ctx.isPointInStroke(...inStroke), false)
+      ctx.resetTransform()
+      assert.equal(ctx.isPointInPath(...inFill), true)
+
+      // the path keeps the transform it was built with
+      ctx.translate(100, 0)
+      assert.equal(ctx.isPointInPath(...inFill), true)
+      assert.equal(ctx.isPointInStroke(...inStroke), true)
+
+      // line width scales with the transform
+      ctx.resetTransform()
+      ctx.beginPath()
+      ctx.scale(2, 2)
+      ctx.rect(50,50,50,50)
+      ctx.lineWidth = 6
+
+      assert.equal(ctx.isPointInPath(...inStroke), false)
+      assert.equal(ctx.isPointInStroke(...inStroke), true)
+
+      assert.equal(ctx.isPointInPath(...inFill), true)
+      assert.equal(ctx.isPointInStroke(...inFill), false)
+
+      assert.equal(ctx.isPointInPath(...inBoth), true)
+      assert.equal(ctx.isPointInStroke(...inBoth), true)
+    })
+
+    test("isPointInPath(Path2D)", () => {
+      let inStroke = /** @type {const} */ ([100, 94]),
+          inFill = /** @type {const} */ ([150, 150]),
+          inBoth = /** @type {const} */ ([100, 100]);
+
+      let path = new Path2D()
+      path.rect(100,100,100,100)
+      ctx.lineWidth = 12
+
+      assert.equal(ctx.isPointInPath(path, ...inStroke), false)
+      assert.equal(ctx.isPointInStroke(path, ...inStroke), true)
+
+      assert.equal(ctx.isPointInPath(path, ...inFill), true)
+      assert.equal(ctx.isPointInStroke(path, ...inFill), false)
+
+      assert.equal(ctx.isPointInPath(path, ...inBoth), true)
+      assert.equal(ctx.isPointInStroke(path, ...inBoth), true)
+
+      // nothing is hit while the transform is singular
+      ctx.scale(0, 0)
+      assert.equal(ctx.isPointInPath(path, ...inFill), false)
+      assert.equal(ctx.isPointInStroke(path, ...inStroke), false)
+    })
+
+    test("letterSpacing", () => {
+        FontLibrary.use(`tests/assets/fonts/Monoton-Regular.woff`)
+
+        let [x, y] = [40, 100]
+        let size = 32
+        let text = "RR"
+        ctx.font = `${size}px Monoton`
+        ctx.letterSpacing = '20px'
+        ctx.fillStyle = 'black'
+        ctx.fillText(text, x, y)
+
+        // there should be no initial added space indenting the beginning of the line
+        assert.equal(ctx.getImageData(x, y-size, 10, size).data.some(a => a), true)
+
+        // there should be whitespace between the first and second characters
+        assert.equal(ctx.getImageData(x+28, y-size, 18, size).data.some(a => a), false)
+
+        // check whether upstream has fixed the indent bug and our compensation is now outdenting
+        assert.equal(ctx.getImageData(x-20, y-size, 18, size).data.some(a => a), false)
+
+        // width keeps the trailing letter-space (full advance), matching Chrome/Safari
+        let m = ctx.measureText(text)
+        assert.nearEqual(m.width, 94)
+        // actualBoundingBox is ink-based, so its right edge stops short of the advance width by
+        // roughly the trailing letter-space. Asserted as a relation rather than a fixed number:
+        // ink extents come off the rasterized outline, so FreeType and CoreText legitimately
+        // disagree by a pixel (advances come from the font's hmtx, hence the exact check above).
+        let trailing = m.width - m.actualBoundingBoxRight
+        assert(Math.abs(trailing - 20) <= 2,
+          `expected ink to stop ~20px short of the advance, got ${trailing}`)
+        ctx.textWrap = true
+        assert.nearEqual(ctx.measureText(text).width, 94)
+    })
+
+    test("textWrap", () => {
+      FontLibrary.use(`tests/assets/fonts/Monoton-Regular.woff`)
+      let inkHeight = () => {
+        let data = ctx.getImageData(0, 0, WIDTH, HEIGHT).data,
+            minY = HEIGHT,
+            maxY = 0
+        for (let i = 3; i < data.length; i += 4){
+          if (data[i] > 128){
+            let y = Math.floor(i / 4 / WIDTH)
+            minY = Math.min(minY, y)
+            maxY = Math.max(maxY, y)
+          }
+        }
+        return Math.max(0, maxY - minY)
+      }
+
+      assert.equal(ctx.textWrap, false)
+      ctx.font = '20px Monoton'
+      ctx.fillText('word '.repeat(12), 10, 30, 150)
+      let single = inkHeight()
+      assert(single > 0)
+
+      // with wrapping enabled, the width limit becomes a column width
+      canvas.width = WIDTH
+      ctx.font = '20px Monoton'
+      ctx.textWrap = true
+      assert.equal(ctx.textWrap, true)
+      ctx.fillText('word '.repeat(12), 10, 30, 150)
+      assert(inkHeight() > single * 2)
+
+      // make sure soft-hyphens are drawn when the line breaks on them
+      canvas.width = WIDTH
+      ctx.font = '20px Monoton'
+      ctx.textWrap = true
+      ctx.fillText('word\u00ADword\u00ADword\u00ADword', 10, 30, 150)
+      let {data} = ctx.getImageData(155, 17, 10, 10)
+      assert(data.some(a => a))
+    })
+
+    test("createProjection()", () => {
+      /** @type {[number,number, number,number, number,number, number,number]} */
+      let quad = [
+        WIDTH*.33, HEIGHT/2,
+        WIDTH*.66, HEIGHT/2,
+        WIDTH, HEIGHT*.9,
+        0, HEIGHT*.9,
+      ]
+
+      let matrix = ctx.createProjection(quad)
+      ctx.setTransform(matrix)
+
+      ctx.fillStyle = 'black'
+      ctx.fillRect(0,0, WIDTH/4, HEIGHT)
+      ctx.fillStyle = 'white'
+      ctx.fillRect(WIDTH/4, 0, WIDTH/4, HEIGHT)
+      ctx.fillStyle = 'green'
+      ctx.fillRect(WIDTH/2, 0, WIDTH/4, HEIGHT)
+      ctx.resetTransform()
+
+      let x = WIDTH/2, y = HEIGHT/2 + 2
+      assert.deepEqual(pixel(x, y - 5), CLEAR)
+      assert.deepEqual(pixel(x + 25, y), GREEN)
+      assert.deepEqual(pixel(x + 75, y), CLEAR)
+      assert.deepEqual(pixel(x - 25, y), WHITE)
+      assert.deepEqual(pixel(x - 75, y), BLACK)
+      assert.deepEqual(pixel(x - 100, y), CLEAR)
+
+      y = HEIGHT*.9 - 2
+      assert.deepEqual(pixel(x + 100, y), GREEN)
+      assert.deepEqual(pixel(x + 130, y), CLEAR)
+      assert.deepEqual(pixel(x - 75, y), WHITE)
+      assert.deepEqual(pixel(x - 200, y), BLACK)
+      assert.deepEqual(pixel(0, y), CLEAR)
+    })
+
+    test('reset()', async () => {
+      ctx.fillStyle = 'green'
+      ctx.scale(2, 2)
+      ctx.translate(0, -HEIGHT/4)
+
+      ctx.fillRect(WIDTH/4, HEIGHT/4, WIDTH/8, HEIGHT/8)
+      assert.deepEqual(pixel(WIDTH * .5 + 1, 0), GREEN)
+      assert.deepEqual(pixel(WIDTH * .75 - 1, 0), GREEN)
+
+      ctx.beginPath()
+      ctx.rect(WIDTH/4, HEIGHT/2, 100, 100)
+      ctx.reset()
+      ctx.fill()
+      assert.deepEqual(pixel(WIDTH/2 + 1, HEIGHT/2 + 1), CLEAR)
+      assert.deepEqual(pixel(WIDTH * .5 + 1, 0), CLEAR)
+      assert.deepEqual(pixel(WIDTH * .75 - 1, 0), CLEAR)
+
+      ctx.globalAlpha = 0.4
+      ctx.reset()
+      ctx.fillRect(WIDTH/2, HEIGHT/2, 3, 3)
+      assert.deepEqual(pixel(WIDTH/2 + 1, HEIGHT/2 + 1), BLACK)
+    })
+
+    describe("measureText()", () => {
+      test("line metrics", () => {
+        FontLibrary.use('MeasureFace', [`tests/assets/fonts/montserrat-latin/montserrat-v30-latin-regular.woff2`])
+        ctx.font = "20px MeasureFace"
+
+        let ø = ctx.measureText('').width,
+            _ = ctx.measureText(' ').width,
+            __ = ctx.measureText('  ').width,
+            foo = ctx.measureText('foo').width,
+            foobar = ctx.measureText('foobar').width,
+            __foo = ctx.measureText('  foo').width,
+            __foo__ = ctx.measureText('  foo  ').width
+        assert(ø < _)
+        assert(_ < __)
+        assert(foo < foobar)
+        assert(__foo > foo)
+        assert(__foo__ > __foo)
+
+        // start from the default, alphabetic baseline
+        let msg = "Lordran gypsum",
+            metrics = ctx.measureText(msg)
+
+        // + means up, - means down when it comes to baselines; these also confirm the implicit
+        // default font (no ctx.font set) reports non-alphabetic baselines
+        assert.equal(metrics.alphabeticBaseline, 0)
+        assert(metrics.hangingBaseline > 0)
+        assert(metrics.ideographicBaseline < 0)
+
+        // for ascenders + means up, for descenders + means down
+        assert(metrics.actualBoundingBoxAscent > 0)
+        assert(metrics.actualBoundingBoxDescent > 0)
+        assert(metrics.actualBoundingBoxAscent > metrics.actualBoundingBoxDescent)
+
+        // make sure the polarity has flipped for 'top' baseline
+        ctx.textBaseline = "top"
+        metrics = ctx.measureText("Lordran gypsum")
+        assert(metrics.alphabeticBaseline < 0)
+        assert(metrics.hangingBaseline < 0)
+        assert(metrics.actualBoundingBoxAscent < 0)
+        assert(metrics.actualBoundingBoxDescent > 0)
+
+        // width calculations should be the same (modulo rounding) for any alignment
+        let [lft, cnt, rgt] = /** @type {const} */ (['left', 'center', 'right']).map(align => {
+          ctx.textAlign = align
+          return ctx.measureText(msg).width
+        })
+        assert.nearEqual(lft, cnt)
+        assert.nearEqual(cnt, rgt)
+
+        // make sure string indices account for trailing whitespace and non-8-bit characters
+        let text = ' 石 ',
+            {startIndex, endIndex} = ctx.measureText(text).lines[0]
+        assert.equal(text.substring(startIndex, endIndex), text)
+      })
+
+      test("blank line ranges", () => {
+        ctx.font = '16px sans-serif'
+        ctx.textWrap = true
+        for (let text of ['abcdef\n\ncd', '石石\n\ncd', 'abc\n   \ncd']){
+          let blank = ctx.measureText(text, 500).lines[1],
+              start = text.indexOf('\n') + 1
+          assert.equal(blank.startIndex, start, JSON.stringify(text))
+          assert.equal(blank.endIndex, start, JSON.stringify(text))
+        }
+
+        // the empty line after a final newline starts (and ends) just past it
+        for (let text of ['x\n', '\n', '\n\n', '石\n']){
+          let last = ctx.measureText(text, 500).lines.at(-1)
+          assert.deepEqual([last.startIndex, last.endIndex], [text.length, text.length], JSON.stringify(text))
+        }
+      })
+
+      test("blank line rects", () => {
+        ctx.font = '16px sans-serif'
+        ctx.textWrap = true
+        ctx.textBaseline = 'top'
+        for (const textAlign of /** @type {const} */ (['left', 'center', 'right'])){
+          ctx.textAlign = textAlign
+          let [first, blank, last] = ctx.measureText('abc\n\nabc', 200).lines
+          // empty, at the line's start (the anchor's x for every alignment) and on its alphabetic baseline
+          assert.equal(blank.width, 0, textAlign)
+          assert.equal(blank.height, 0, textAlign)
+          assert.nearEqual(blank.x, 0, 0.001)
+          assert.nearEqual(blank.y, blank.alphabeticBaseline, 0.001)
+          assert(first.y < blank.y && blank.y < last.y, textAlign)
+          assert.deepEqual([blank.runs[0].x, blank.runs[0].y], [blank.x, blank.y])
+        }
+      })
+
+      test("blank lines after multi-byte text", () => {
+        FontLibrary.use("LatinOnly", [`tests/assets/fonts/montserrat-latin/montserrat-v30-latin-regular.woff2`])
+        FontLibrary.use("CyrillicToo", [`tests/assets/fonts/Oswald-Medium.ttf`])
+        ctx.font = '16px LatinOnly, CyrillicToo'
+        ctx.textWrap = true
+
+        // the multi-byte Cyrillic (set in the second face) precedes the blank line's start in the text
+        let [first, blank, last] = ctx.measureText('ЖЖЖЖЖЖab\n\nabc', 500).lines
+        assert.equal(first.runs[0].family, 'Oswald')
+        assert.equal(blank.runs[0].family, last.runs[0].family)
+      })
+
+
+      // measurements are cached as serialized strings keyed on a hash of the typography state, with
+      // the memo dropped outright whenever the font set changes, so these pin the two ways it could
+      // go wrong: serving a stale entry after a state change, and serving a pre-`use()` fallback
+      // measurement after the named family has actually been loaded
+      test("repeated calls", () => {
+        ctx.font = '16px sans-serif'
+        let first = ctx.measureText('repeat me')
+        ctx.fillText('unrelated drawing', 10, 100)
+        let again = ctx.measureText('repeat me')
+        assert.deepEqual({...again}, {...first})
+      })
+
+      test("state changes", () => {
+        ctx.font = '16px sans-serif'
+        let m16 = ctx.measureText('measure me').width
+        ctx.font = '32px sans-serif'
+        let m32 = ctx.measureText('measure me').width
+        // same face at double size: a stale cache would return m16, i.e. be off by 2×. The tolerance is
+        // relative because FreeType reports unhinted advances in 1/64 px (and skparagraph offers no
+        // linear-metrics switch), so on Linux the doubling isn't bit-exact
+        assert.nearEqual(m32, m16 * 2, m32 * 1e-3)
+
+        ctx.letterSpacing = '4px'
+        assert.ok(ctx.measureText('measure me').width > m32, 'letterSpacing should re-measure')
+        ctx.letterSpacing = '0px'
+
+        // a save/restore round-trip returns to a previously-measured state; the value-keyed cache
+        // must hit it again with the *original* result (an epoch/counter scheme would miss here)
+        ctx.save()
+        ctx.font = '16px sans-serif'
+        assert.nearEqual(ctx.measureText('measure me').width, m16)
+        ctx.restore()
+        assert.nearEqual(ctx.measureText('measure me').width, m32)
+      })
+
+      test("font loading", () => {
+        ctx.font = '32px MemoFace' // not yet registered: measures with the fallback face
+        let fallback = ctx.measureText('Wavy Text').width
+
+        FontLibrary.use("MemoFace", [`tests/assets/fonts/Monoton-Regular.woff`])
+        let loaded = ctx.measureText('Wavy Text').width
+
+        // Monoton's display letterforms are far wider than any sans fallback, so an unchanged
+        // width means the pre-load measurement was served from the cache
+        assert.ok(Math.abs(loaded - fallback) > 1, `expected re-measure after use() (${fallback} vs ${loaded})`)
+      })
+
+      test("ink bounds by textBaseline", () => {
+        // fillText() and measureText() each have to account for the textBaseline shift exactly
+        // once, so the drawn ink should be centered on the actualBoundingBox for every setting
+        // (compare centers since the glyph-outline bounds run slightly past the antialiased ink)
+        FontLibrary.use('BaselineFace', [`tests/assets/fonts/montserrat-latin/montserrat-v30-latin-regular.woff2`])
+        let [x, y, text] = [20, 200, 'Hgjy']
+        for (const baseline of /** @type {const} */ (['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom'])){
+          ctx.clearRect(0, 0, WIDTH, HEIGHT)
+          ctx.font = '48px BaselineFace'
+          ctx.textBaseline = baseline
+          ctx.fillText(text, x, y)
+
+          let {data} = ctx.getImageData(0, 0, WIDTH, HEIGHT),
+              rows = [...Array(HEIGHT).keys()].filter(r => data.subarray(r * WIDTH * 4, (r + 1) * WIDTH * 4).some((v, i) => i % 4 == 3 && v > 0)),
+              inkCenter = (rows[0] + rows[rows.length - 1] + 1) / 2,
+              m = ctx.measureText(text),
+              boxCenter = y + (m.actualBoundingBoxDescent - m.actualBoundingBoxAscent) / 2
+          assert.nearEqual(inkCenter, boxCenter, 1)
+        }
+      })
+
+      test("font & em boxes by textBaseline", () => {
+        FontLibrary.use('BaselineFace', [`tests/assets/fonts/montserrat-latin/montserrat-v30-latin-regular.woff2`])
+        ctx.font = '48px BaselineFace'
+        ctx.textBaseline = 'alphabetic'
+        let alpha = ctx.measureText('Hgjy'),
+            fontHeight = alpha.fontBoundingBoxAscent + alpha.fontBoundingBoxDescent
+        assert.nearEqual(alpha.emHeightAscent + alpha.emHeightDescent, 48)
+
+        for (const baseline of /** @type {const} */ (['top', 'hanging', 'middle', 'alphabetic', 'ideographic', 'bottom'])){
+          ctx.textBaseline = baseline
+          let m = ctx.measureText('Hgjy'), offset = m.alphabeticBaseline // < 0 when this baseline is above the alphabetic
+          // the boxes keep their size and move by exactly the distance between the two baselines
+          assert.nearEqual(m.fontBoundingBoxAscent + m.fontBoundingBoxDescent, fontHeight, 0.01)
+          assert.nearEqual(m.emHeightAscent + m.emHeightDescent, 48, 0.01)
+          assert.nearEqual(m.fontBoundingBoxAscent, alpha.fontBoundingBoxAscent + offset, 0.01)
+          assert.nearEqual(m.emHeightAscent, alpha.emHeightAscent + offset, 0.01)
+        }
+
+        // top/middle/bottom are the em square's edges & midpoint
+        ctx.textBaseline = 'top'
+        assert.nearEqual(ctx.measureText('Hgjy').emHeightAscent, 0, 0.01)
+        ctx.textBaseline = 'bottom'
+        assert.nearEqual(ctx.measureText('Hgjy').emHeightDescent, 0, 0.01)
+        ctx.textBaseline = 'middle'
+        let middle = ctx.measureText('Hgjy')
+        assert.nearEqual(middle.emHeightAscent, 24, 0.01)
+        assert.nearEqual(middle.emHeightDescent, 24, 0.01)
+      })
+
+      test("em square vs. font box", () => {
+        // Amstelvar: unitsPerEm 2000, hhea 1900/-500 but OS/2 typo 1500/-500 (and USE_TYPO_METRICS unset)
+        FontLibrary.use('TypoFace', [`tests/assets/fonts/AmstelvarAlpha-VF.ttf`])
+        ctx.font = '100px TypoFace'
+        ctx.textBaseline = 'alphabetic'
+        let m = ctx.measureText('Hgjy')
+        assert.strictEqual(m.emHeightAscent, 75)
+        assert.strictEqual(m.emHeightDescent, 25)
+        assert.strictEqual(m.fontBoundingBoxAscent, 95)
+        assert.strictEqual(m.fontBoundingBoxDescent, 25)
+
+        // so `top` sits on the em square, 20px below the font box's top
+        ctx.textBaseline = 'top'
+        let top = ctx.measureText('Hgjy')
+        assert.nearEqual(top.alphabeticBaseline, -75, 0.01)
+        assert.nearEqual(top.emHeightAscent, 0, 0.01)
+        assert.nearEqual(top.fontBoundingBoxAscent, 20, 0.01)
+      })
+
+      test("font & em boxes from metrics tables", () => {
+        // Oswald: unitsPerEm 1000, hhea ascender 1193 / descender -289, no line gap
+        FontLibrary.use('TableFace', [`tests/assets/fonts/Oswald-Medium.ttf`])
+        ctx.font = '100px TableFace'
+        ctx.textBaseline = 'alphabetic'
+        let m = ctx.measureText('Hgjy'),
+            ascent = 1193 * 100 / 1000,
+            descent = 289 * 100 / 1000
+        assert.strictEqual(m.fontBoundingBoxAscent, ascent)
+        assert.strictEqual(m.fontBoundingBoxDescent, descent)
+        assert.strictEqual(m.emHeightAscent, 100 * ascent / (ascent + descent))
+        assert.strictEqual(m.emHeightDescent, 100 * descent / (ascent + descent))
+        assert.nearEqual(m.hangingBaseline, ascent * 0.8, 0.001)
+      })
+
+      test("variable font MVAR deltas", () => {
+        // Geomini: unitsPerEm 1000, typo (= hhea) metrics 1055/-145 at wght 200 and 1033/-167 at wght 800
+        FontLibrary.use('VariableFace', [`tests/assets/fonts/Geomini-VF.ttf`])
+        ctx.textBaseline = 'alphabetic'
+        for (const [weight, ascender, descender] of [[200, 1055, 145], [800, 1033, 167]]){
+          ctx.font = `${weight} 100px VariableFace`
+          let m = ctx.measureText('Hgjy')
+          assert.nearEqual(m.fontBoundingBoxAscent, ascender / 10, 0.01)
+          assert.nearEqual(m.fontBoundingBoxDescent, descender / 10, 0.01)
+          assert.nearEqual(m.emHeightAscent, 100 * ascender / 1200, 0.01)
+          assert.nearEqual(m.emHeightDescent, 100 * descender / 1200, 0.01)
+        }
+      })
+
+      test("BASE table baselines", () => {
+        // CanvasTest: unitsPerEm 1024, typo 768/-256, BASE (DFLT) hang 512, ideo 128, romn 0
+        FontLibrary.use('BaseFace', [`tests/assets/fonts/CanvasTest.ttf`])
+        ctx.font = '128px BaseFace'
+        ctx.textBaseline = 'alphabetic'
+        let m = ctx.measureText('A')
+        assert.nearEqual(m.alphabeticBaseline, 0, 0.001)
+        assert.nearEqual(m.hangingBaseline, 64, 0.001)
+        assert.nearEqual(m.ideographicBaseline, 16, 0.001)
+
+        // the textBaseline offsets use the same positions
+        ctx.textBaseline = 'hanging'
+        assert.nearEqual(ctx.measureText('A').alphabeticBaseline, -64, 0.001)
+        ctx.textBaseline = 'ideographic'
+        assert.nearEqual(ctx.measureText('A').alphabeticBaseline, -16, 0.001)
+      })
+
+      test("ink bounds from glyph outlines", () => {
+        FontLibrary.use('TableFace', [`tests/assets/fonts/Oswald-Medium.ttf`])
+        ctx.font = '48px TableFace'
+        ctx.textBaseline = 'alphabetic'
+        for (const text of ['Hgjy', 'label-42', 'OOO', 'ÀÇÉ']){
+          let m = ctx.measureText(text),
+              {left, right, top, bottom} = ctx.outlineText(text).bounds
+          assert.nearEqual(m.actualBoundingBoxLeft, -left, 0.01)
+          assert.nearEqual(m.actualBoundingBoxRight, right, 0.01)
+          assert.nearEqual(m.actualBoundingBoxAscent, -top, 0.01)
+          assert.nearEqual(m.actualBoundingBoxDescent, bottom, 0.01)
+        }
+      })
+
+      test("whitespace normalization", () => {
+        FontLibrary.use('TableFace', [`tests/assets/fonts/Oswald-Medium.ttf`])
+        ctx.font = '20px TableFace'
+        ctx.textWrap = false
+        let {width, actualBoundingBoxRight} = ctx.measureText('A B')
+        for (const ws of ['\t', '\n', '\f', '\r', '\v', '\u2028', '\u2029']){
+          let m = ctx.measureText(`A${ws}B`)
+          assert.equal(m.width, width, JSON.stringify(ws))
+          assert.equal(m.actualBoundingBoxRight, actualBoundingBoxRight, JSON.stringify(ws))
+          // a leading form feed used to leave nothing to measure
+          assert.ok(ctx.measureText(`${ws}A`).actualBoundingBoxRight > 0, JSON.stringify(ws))
+        }
+
+        // when wrapping, only newlines (and the line & paragraph separators) break lines
+        ctx.textWrap = true
+        for (const br of ['\n', '\u2028', '\u2029']){
+          assert.equal(ctx.measureText(`A${br}B`, 200).lines.length, 2, JSON.stringify(br))
+        }
+        for (const ws of ['\t', '\f', '\r', '\v']){
+          assert.equal(ctx.measureText(`A${ws}B`, 200).lines.length, 1, JSON.stringify(ws))
+        }
+        ctx.textWrap = false
+      })
+    })
+
+    describe('drawImage()', () => {
+      test("bitmaps", async () => {
+        let image = await loadAsset('checkers.png')
+        ctx.imageSmoothingEnabled = false
+
+        ctx.drawImage(image, 0,0)
+        assert.deepEqual(pixel(0, 0), BLACK)
+        assert.deepEqual(pixel(1, 0), WHITE)
+        assert.deepEqual(pixel(0, 1), WHITE)
+        assert.deepEqual(pixel(1, 1), BLACK)
+
+        ctx.drawImage(image,-256,-256,512,512)
+        assert.deepEqual(pixel(0, 0), BLACK)
+        assert.deepEqual(pixel(149, 149), BLACK)
+
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.save()
+        ctx.translate(WIDTH/2, HEIGHT/2)
+        ctx.rotate(.25*Math.PI)
+        ctx.drawImage(image,-256,-256,512,512)
+        ctx.restore()
+        assert.deepEqual(pixel(0, 0), CLEAR)
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT*.25), BLACK)
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT*.75), BLACK)
+        assert.deepEqual(pixel(WIDTH*.25, HEIGHT/2), WHITE)
+        assert.deepEqual(pixel(WIDTH*.75, HEIGHT/2), WHITE)
+        assert.deepEqual(pixel(WIDTH-1, HEIGHT-1), CLEAR)
+
+        let srcCanvas = new Canvas(3, 3),
+            srcCtx = srcCanvas.getContext("2d");
+        srcCtx.fillStyle = 'green'
+        srcCtx.fillRect(0,0,3,3)
+        srcCtx.clearRect(1,1,1,1)
+
+        ctx.drawImage(srcCanvas, 0,0)
+        assert.deepEqual(pixel(0, 0), GREEN)
+        assert.deepEqual(pixel(1, 1), CLEAR)
+        assert.deepEqual(pixel(2, 2), GREEN)
+
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.drawImage(srcCanvas,-2,-2,6,6)
+        assert.deepEqual(pixel(0, 0), CLEAR)
+        assert.deepEqual(pixel(2, 0), GREEN)
+        assert.deepEqual(pixel(2, 2), GREEN)
+
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.save()
+        ctx.translate(WIDTH/2, HEIGHT/2)
+        ctx.rotate(.25*Math.PI)
+        ctx.drawImage(srcCanvas,-256,-256,512,512)
+        ctx.restore()
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT*.25), GREEN)
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT*.75), GREEN)
+        assert.deepEqual(pixel(WIDTH*.25, HEIGHT/2), GREEN)
+        assert.deepEqual(pixel(WIDTH*.75, HEIGHT/2), GREEN)
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT/2), CLEAR)
+
+        // negative dest / source dimensions: the rect normalizes to a sorted corner-pair
+        // (relocate), and content is never mirrored — verified to match browsers. [#283/#283b]
+        let asym = new Canvas(2, 2), asymCtx = asym.getContext('2d')
+        asymCtx.fillStyle = 'green'; asymCtx.fillRect(0, 0, 2, 2)
+        asymCtx.fillStyle = 'white'; asymCtx.fillRect(0, 0, 1, 1) // marker in the TOP-LEFT cell only
+
+        // negative dest w/h: dest (12,12)+(-2,-2) normalizes to the (10,10)-(12,12) rect
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.drawImage(asym, 12, 12, -2, -2)
+        assert.deepEqual(pixel(10, 10), WHITE)  // top-left marker stays top-left (no mirror)
+        assert.deepEqual(pixel(11, 10), GREEN)
+        assert.deepEqual(pixel(10, 11), GREEN)
+        assert.deepEqual(pixel(13, 13), CLEAR)  // nothing painted in the positive direction
+
+        // negative source w/h (9-arg): src (2,2)+(-2,-2) normalizes to the full (0,0,2,2)
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.drawImage(asym, 2, 2, -2, -2, 20, 20, 2, 2)
+        assert.deepEqual(pixel(20, 20), WHITE)  // marker preserved → source sampled, not mirrored
+        assert.deepEqual(pixel(21, 20), GREEN)
+      })
+
+      test("vectors", async () => {
+        // an SVG Image's picture is wrapped in a synthetic Page and drawn as an embed, so repeated
+        // draws share one cached device-scale raster. these pin the properties that must survive
+        // the cache: repeated draws are identical, distinct images stay distinct, upscales stay
+        // analytically crisp (scale-then-rasterize — the whole point of a vector source), and an
+        // overdrawn source rect gets cropped the same way no matter what the CTM is doing
+        const svg = (fill) => 'data:image/svg+xml;base64,' + Buffer.from(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="${fill}"/></svg>`
+        ).toString('base64')
+        let green = await loadImage(svg('green')),
+            black = await loadImage(svg('black'))
+
+        ctx.drawImage(green, 0, 0)
+        ctx.drawImage(green, 20, 0)   // second draw: served from the cached raster
+        ctx.drawImage(black, 40, 0)   // distinct image: its own cache identity
+        assert.deepEqual(pixel(4, 4), GREEN)
+        assert.deepEqual(pixel(24, 4), GREEN)
+        assert.deepEqual(pixel(44, 4), BLACK)
+
+        // a cached upscale must stay crisp: the raster is built at the *placed* scale, so a
+        // mid-shape sample sits at full ink rather than on an interpolated ramp
+        let circle = await loadImage('data:image/svg+xml;base64,' + Buffer.from(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="1" height="2" fill="black"/><rect x="1" width="1" height="2" fill="white"/></svg>`
+        ).toString('base64'))
+        ctx.clearRect(0, 0, WIDTH, HEIGHT)
+        ctx.drawImage(circle, 0, 100, 64, 64)
+        ctx.drawImage(circle, 100, 100, 64, 64) // cache hit at the same scale
+        assert.deepEqual(pixel(24, 132), BLACK)  // inside the black half: unblended…
+        assert.deepEqual(pixel(124, 132), BLACK) // …on the cached copy too
+
+        // a source rect spilling past the image on all four sides has to land in the same place
+        // whether the caller pre-trims it or not. drawing by reference means an untrimmed dst_rect
+        // widens the region recorded for the placement — invisible while the CTM is axis-aligned,
+        // but it moves the result once there's a rotation, scale, or skew
+        let checks = await loadImage('data:image/svg+xml;base64,' + Buffer.from(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">` +
+          Array.from({length: 100}, (_, i) => {
+            let x = i % 10, y = (i / 10) | 0
+            return `<rect x="${x}" y="${y}" width="1" height="1" fill="${(x + y) % 2 ? '#0a0' : '#fff'}"/>`
+          }).join('') + `</svg>`
+        ).toString('base64'))
+
+        // src (-3.5,-3.5)…(13.5,13.5) → dst (0,0)…(34,34) trims to src (0,0)…(10,10) → dst (7,7)…(27,27)
+        /** @param {[number,number,number,number,number,number,number,number]} coords */
+        const placed = (coords, warp) => {
+          let c = new Canvas(40, 40), x = c.getContext('2d')
+          warp(x)
+          x.drawImage(checks, ...coords)
+          return c.toBufferSync('png')
+        }
+
+        for (let warp of [
+          x => { x.translate(20, 20); x.rotate(0.3); x.translate(-20, -20) },
+          x => x.scale(1.7, 1.7),
+          x => x.transform(1, 0.2, 0.3, 1, 0, 0),
+        ]){
+          assert.deepEqual(
+            placed([-3.5, -3.5, 17, 17, 0, 0, 34, 34], warp), // overdraws all four sides
+            placed([0, 0, 10, 10, 7, 7, 20, 20], warp)        // the same draw, pre-trimmed
+          )
+        }
+      })
+
+      test("empty rects", async () => {
+        // a crop that misses the source entirely, or that has no area, has to leave the canvas
+        // untouched: clipping it can't hand back an inverted rect, and the src→dst scale can't
+        // divide by a zero-width crop and reach the draw with NaN edges
+        let raster = new Canvas(8, 8), rasterCtx = raster.getContext('2d')
+        rasterCtx.fillStyle = 'green'
+        rasterCtx.fillRect(0, 0, 8, 8)
+
+        let bitmap = await loadImage(await raster.toBuffer('png')),
+            vector = await loadImage('data:image/svg+xml;base64,' + Buffer.from(
+              `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="green"/></svg>`
+            ).toString('base64'))
+
+        const nothings = {
+          'entirely right of the source': [20, 0, 8, 8, 0, 0, 16, 16],
+          'entirely left':                [-30, 0, 8, 8, 0, 0, 16, 16],
+          'entirely below':               [0, 20, 8, 8, 0, 0, 16, 16],
+          'entirely above':               [0, -30, 8, 8, 0, 0, 16, 16],
+          'zero-width crop':              [0, 0, 0, 8, 0, 0, 16, 16],
+          'zero-height crop':             [0, 0, 8, 0, 0, 0, 16, 16],
+        }
+
+        // each route that trims a crop: drawImage()'s bitmap and vector arms, plus drawCanvas()
+        const routes = {
+          bitmap:     (x, coords) => x.drawImage(bitmap, ...coords),
+          vector:     (x, coords) => x.drawImage(vector, ...coords),
+          drawCanvas: (x, coords) => x.drawCanvas(raster, ...coords),
+        }
+
+        for (let [route, draw] of Object.entries(routes)){
+          for (let [label, coords] of Object.entries(nothings)){
+            let x = new Canvas(16, 16).getContext('2d')
+            draw(x, coords)
+            assert.ok(
+              x.getImageData(0, 0, 16, 16).data.every(v => v === 0),
+              `${route}: a crop ${label} painted something`
+            )
+          }
+
+          // the same route with an in-bounds crop still paints, so the checks above aren't vacuous
+          let x = new Canvas(16, 16).getContext('2d')
+          draw(x, [0, 0, 8, 8, 0, 0, 16, 16])
+          assert.deepEqual(Array.from(x.getImageData(8, 8, 1, 1).data), GREEN)
+        }
+
+        // …and skipping has to be a true no-op, not a draw of an empty region. the compositing
+        // modes that clear outside the source would otherwise erase the whole canvas — which is
+        // what a zero-size crop used to do on the bitmap path. per spec, "if one of the sw or sh
+        // arguments is zero, then return. Nothing is painted."
+        for (let [route, draw] of Object.entries(routes)){
+          for (let gco of /** @type {const} */ (['copy', 'destination-in', 'source-in', 'destination-atop', 'source-out'])){
+            for (let [label, coords] of Object.entries(nothings)){
+              let x = new Canvas(16, 16).getContext('2d')
+              x.fillStyle = 'green'
+              x.fillRect(0, 0, 16, 16)
+              x.globalCompositeOperation = gco
+              draw(x, coords)
+              assert.deepEqual(
+                Array.from(x.getImageData(8, 8, 1, 1).data), GREEN,
+                `${route}: a crop ${label} under "${gco}" disturbed the canvas`
+              )
+            }
+          }
+        }
+
+        // nor can a skipped draw leave traces in a vector export: an off-image crop used to embed
+        // the whole (never-rendered) source as base64 in a <defs> block, along with a clip and a
+        // <use> placing it off-canvas — bloating every export for a draw that paints nothing
+        const exported = (draw) => {
+          let c = new Canvas(24, 24), x = c.getContext('2d')
+          x.fillStyle = 'green'
+          x.fillRect(2, 2, 8, 8)
+          draw(x)
+          return c.toBufferSync('svg').toString().replace(/(cl|img)_\d+/g, '$1_N')
+        }
+
+        let baseline = exported(() => {})
+        for (let [route, draw] of Object.entries(routes)){
+          for (let [label, coords] of Object.entries(nothings)){
+            assert.equal(
+              exported(x => draw(x, coords)), baseline,
+              `${route}: a crop ${label} left traces in the SVG export`
+            )
+          }
+        }
+      })
+
+      test("canvases", () => {
+        const swatch = (color, size=8) => {
+          let c = new Canvas(size, size), x = c.getContext('2d')
+          x.fillStyle = color
+          x.fillRect(0, 0, size, size)
+          return c
+        }
+
+        // A canvas source is snapshotted to an intermediate raster memoized on the recording's
+        // PageStamp, so drawing into the source between two draws has to invalidate it. The two
+        // cases below are the only routes by which that memo can go stale — both grow the layer
+        // count while leaving the page id alone. Mutating the source via an erase idiom (assigning
+        // .width, clearing the whole canvas) is deliberately *not* covered: those replace the
+        // recorder outright, so the memo is reset structurally and no keying mistake is reachable.
+        // Verified by mutation testing — a memo hard-wired to always hit still passes every
+        // erase-idiom variant of these.
+        {
+          let src = swatch('green'),
+              srcCtx = src.getContext('2d')
+
+          ctx.drawImage(src, 0, 0)
+          assert.deepEqual(pixel(4, 4), GREEN)
+
+          // deliberately a *partial* fill: covering the whole source would be an erase idiom, which
+          // mints a fresh page id and would let an invalidation keyed on id alone still pass. Only a
+          // partial draw leaves the id intact and moves the layer count on its own.
+          srcCtx.fillStyle = 'black'
+          srcCtx.fillRect(0, 0, 4, 4)
+          ctx.drawImage(src, 100, 0)
+
+          assert.deepEqual(pixel(102, 2), BLACK) // the second draw shows the added content…
+          assert.deepEqual(pixel(106, 6), GREEN) // …over the part of the source that didn't change
+          assert.deepEqual(pixel(4, 4), GREEN)   // …and doesn't disturb the first draw
+        }
+
+        // drawCanvas() appends its layer through push_embed, whose own flush() no-ops when nothing
+        // has been drawn since — which is exactly the state a preceding drawImage leaves the source
+        // in. So this grows the layer count by a route that never trips the `changed` flag.
+        ctx.clearRect(0, 0, WIDTH, HEIGHT)
+        {
+          let inner = new Canvas(8, 8), innerCtx = inner.getContext('2d')
+          innerCtx.fillStyle = 'red'
+          innerCtx.fillRect(0, 0, 8, 8)
+          innerCtx.globalCompositeOperation = 'destination-in' // makes the source need isolating
+          innerCtx.fillRect(0, 0, 8, 8)
+
+          let src = swatch('green', 16)
+          ctx.drawImage(src, 0, 0)
+          assert.deepEqual(pixel(4, 4), GREEN)
+
+          src.getContext('2d').drawCanvas(inner, 8, 8)
+          ctx.drawImage(src, 100, 0)
+
+          assert.deepEqual(pixel(112, 12), [255, 0, 0, 255]) // the embedded canvas is visible…
+          assert.deepEqual(pixel(102, 2), GREEN)             // …over the rest of the source
+        }
+
+        // drawImage rasterizes the source at its intrinsic size and then scales that bitmap, so
+        // upscaling interpolates between texel centers. drawCanvas scales the geometry first, so
+        // the same edge stays hard. The two are expected to differ, and memoizing the intermediate
+        // raster must not change which one you get.
+        ctx.clearRect(0, 0, WIDTH, HEIGHT)
+        {
+          let src = new Canvas(2, 2), srcCtx = src.getContext('2d')
+          srcCtx.fillStyle = 'black'; srcCtx.fillRect(0, 0, 1, 2)
+          srcCtx.fillStyle = 'white'; srcCtx.fillRect(1, 0, 1, 2)
+
+          // upscaled 32x, the black→white edge sits at x=32 and the texel centers land at x=16 & 48
+          ctx.imageSmoothingEnabled = true
+          ctx.drawImage(src, 0, 0, 64, 64)
+          let viaImage = pixel(24, 32)[0] // a quarter of the way up the interpolated ramp
+
+          ctx.clearRect(0, 0, WIDTH, HEIGHT)
+          ctx.drawCanvas(src, 0, 0, 64, 64)
+          let viaCanvas = pixel(24, 32)[0] // still inside the black rect, so unblended
+
+          assert.equal(viaCanvas, 0)
+          assert.ok(viaImage > 16, `drawImage should interpolate the upscale (got ${viaImage})`)
+        }
+      })
+    })
+
+
+    describe('drawCanvas()', () => {
+      test('with cached embedding', () => {
+        // an upright placement of *any* source (not just one with target-dependent ops) now records
+        // a Layer::Embed so `resolve` can rasterize it once and blit thereafter. the cached raster
+        // is keyed on the source's PageStamp, so drawing into the source between draws must show up
+        // in the next draw rather than re-blitting the stale raster
+        let src = new Canvas(8, 8), srcCtx = src.getContext('2d')
+        srcCtx.fillStyle = 'green'
+        srcCtx.fillRect(0, 0, 8, 8)
+
+        ctx.drawCanvas(src, 0, 0)
+        ctx.drawCanvas(src, 20, 0) // same stamp: served from the cached raster
+        assert.deepEqual(pixel(4, 4), GREEN)
+        assert.deepEqual(pixel(24, 4), GREEN)
+
+        // partial fill on purpose: a full-canvas fill is an erase idiom that mints a new page id,
+        // which would mask a stale raster keyed on id alone
+        srcCtx.fillStyle = 'black'
+        srcCtx.fillRect(0, 0, 4, 4)
+        ctx.drawCanvas(src, 40, 0)
+
+        assert.deepEqual(pixel(41, 1), BLACK) // the deeper stamp shows the added content…
+        assert.deepEqual(pixel(46, 6), GREEN) // …atop the unchanged remainder
+        assert.deepEqual(pixel(24, 4), GREEN) // …without disturbing the earlier draws
+      })
+
+      test("with negative dimensions", async () => {
+        let srcCanvas = new Canvas(3, 3),
+            srcCtx = srcCanvas.getContext("2d");
+        srcCtx.fillStyle = 'green'
+        srcCtx.fillRect(0,0,3,3)
+        srcCtx.clearRect(1,1,1,1)
+
+        ctx.drawCanvas(srcCanvas, 0,0)
+        assert.deepEqual(pixel(0, 0), GREEN)
+        assert.deepEqual(pixel(1, 1), CLEAR)
+        assert.deepEqual(pixel(2, 2), GREEN)
+
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.drawCanvas(srcCanvas,-2,-2,6,6)
+        assert.deepEqual(pixel(0, 0), CLEAR)
+        assert.deepEqual(pixel(2, 0), GREEN)
+        assert.deepEqual(pixel(2, 2), GREEN)
+
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.save()
+        ctx.translate(WIDTH/2, HEIGHT/2)
+        ctx.rotate(.25*Math.PI)
+        ctx.drawCanvas(srcCanvas,-256,-256,512,512)
+        ctx.restore()
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT*.25), GREEN)
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT*.75), GREEN)
+        assert.deepEqual(pixel(WIDTH*.25, HEIGHT/2), GREEN)
+        assert.deepEqual(pixel(WIDTH*.75, HEIGHT/2), GREEN)
+        assert.deepEqual(pixel(WIDTH/2, HEIGHT/2), CLEAR)
+
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.drawCanvas(srcCanvas, 1,1,2,2, 0,0,2,2)
+        assert.deepEqual(pixel(0, 0), CLEAR)
+        assert.deepEqual(pixel(0, 1), GREEN)
+        assert.deepEqual(pixel(1, 0), GREEN)
+        assert.deepEqual(pixel(1, 1), GREEN)
+
+        // negative dest dims normalize to a sorted corner-pair (relocate, no mirror) [#283]
+        let asym = new Canvas(2, 2), asymCtx = asym.getContext('2d')
+        asymCtx.fillStyle = 'green'; asymCtx.fillRect(0, 0, 2, 2)
+        asymCtx.fillStyle = 'white'; asymCtx.fillRect(0, 0, 1, 1) // marker in the TOP-LEFT cell only
+        ctx.clearRect(0,0,WIDTH,HEIGHT)
+        ctx.drawCanvas(asym, 12, 12, -2, -2)      // → the (10,10)-(12,12) rect
+        assert.deepEqual(pixel(10, 10), WHITE)    // top-left marker stays top-left
+        assert.deepEqual(pixel(11, 10), GREEN)
+        assert.deepEqual(pixel(13, 13), CLEAR)    // nothing in the positive direction
+
+        let image = await loadAsset('checkers.png')
+        assert.doesNotThrow( () => ctx.drawCanvas(image, 0, 0) )
+      })
+
+      test("from a page context", () => {
+        // a multi-page canvas source draws its *newest* page; passing a specific context
+        // from `.pages` selects any page instead (on both the vector and raster paths)
+        let src = new Canvas(8, 8),
+            page1 = src.getContext('2d')
+        page1.fillStyle = 'green'
+        page1.fillRect(0, 0, 8, 8)
+        let page2 = src.newPage()
+        page2.fillStyle = 'white'
+        page2.fillRect(0, 0, 8, 8)
+
+        ctx.drawCanvas(src, 0, 0)           // canvas → newest page
+        ctx.drawCanvas(src.pages[0], 20, 0) // context → first page
+        ctx.drawImage(src.pages[0], 40, 0)  // rasterizing path accepts contexts too
+        assert.deepEqual(pixel(4, 4), WHITE)
+        assert.deepEqual(pixel(24, 4), GREEN)
+        assert.deepEqual(pixel(44, 4), GREEN)
+      })
+
+      test("from a PDF page", async () => {
+        // the contact-sheet path: parse a multi-page pdf once with loadCanvas, then
+        // composite arbitrary pages by drawing their contexts
+        let doc = new Canvas(8, 8),
+            page1 = doc.getContext('2d')
+        page1.fillStyle = 'green'
+        page1.fillRect(0, 0, 8, 8)
+        let page2 = doc.newPage()
+        page2.fillStyle = 'white'
+        page2.fillRect(0, 0, 8, 8)
+
+        let loaded = await loadCanvas(doc.toBufferSync('pdf'))
+        assert.equal(loaded.pages.length, 2)
+        ctx.drawCanvas(loaded.pages[0], 0, 0)
+        ctx.drawCanvas(loaded.pages[1], 20, 0)
+        assert.deepEqual(pixel(4, 4), GREEN)
+        assert.deepEqual(pixel(24, 4), WHITE)
+      })
+
+      test("with a self-compositing source", async () => {
+        // An embedded canvas has to look the same as that canvas rasterized and drawn as an image:
+        // every mode but `source-over` reads the destination inside the drawn object's bounds, so a
+        // source recorded with one has to be isolated or it blends against the *host* instead. All
+        // the geometry is axis-aligned on integer coords, so the two renderings are exactly equal.
+        const MODES = /** @type {const} */ ([
+          'source-over', 'source-in', 'source-out', 'source-atop', 'destination-over',
+          'destination-in', 'destination-out', 'destination-atop', 'lighter', 'copy', 'xor',
+          'multiply', 'screen', 'overlay', 'darken', 'lighten', 'color-dodge', 'difference'])
+
+        let backdrop = ctx2 => { // non-uniform & opaque: blending against it looks different
+          ctx2.fillStyle = 'green'; ctx2.fillRect(0, 0, 120, 120)
+          ctx2.fillStyle = 'yellow'; ctx2.fillRect(0, 0, 60, 120)
+        }
+
+        for (const mode of MODES){
+          let src = new Canvas(60, 60), srcCtx = src.getContext('2d')
+          srcCtx.fillStyle = 'red'; srcCtx.fillRect(0, 0, 40, 40)
+          srcCtx.globalCompositeOperation = mode
+          srcCtx.fillStyle = 'blue'; srcCtx.fillRect(20, 20, 40, 40)
+
+          let expected = new Canvas(120, 120), expectedCtx = expected.getContext('2d')
+          backdrop(expectedCtx)
+          expectedCtx.drawImage(await loadImage(src.toBufferSync('png')), 20, 20)
+
+          let actual = new Canvas(120, 120), actualCtx = actual.getContext('2d')
+          backdrop(actualCtx)
+          actualCtx.drawCanvas(src, 0, 0, 60, 60, 20, 20, 60, 60)
+
+          assert.deepEqual(
+            Array.from(actualCtx.getImageData(0, 0, 120, 120).data),
+            Array.from(expectedCtx.getImageData(0, 0, 120, 120).data),
+            `embedding a canvas that used '${mode}' should match drawImage of the same canvas`
+          )
+        }
+      })
+
+      test('with rect-preserving placements', async () => {
+        // Flips and 90°/180° rotations map rects to rects, so a rect-preservation test would wave
+        // them into the blit-a-raster fast path — where the raster, always built upright, would land
+        // with the mirroring/rotation stripped out. They have to replay as geometry instead. These
+        // placements keep pixels on the integer grid, so the drawImage oracle comparison stays exact.
+        const PLACEMENTS = {
+          'flip-x': ctx2 => { ctx2.translate(100, 20); ctx2.scale(-1, 1) },
+          'flip-y': ctx2 => { ctx2.translate(20, 100); ctx2.scale(1, -1) },
+          'rot90':  ctx2 => { ctx2.translate(100, 20); ctx2.rotate(Math.PI/2) },
+          'rot180': ctx2 => { ctx2.translate(100, 100); ctx2.rotate(Math.PI) },
+        }
+
+        let backdrop = ctx2 => {
+          ctx2.fillStyle = 'green'; ctx2.fillRect(0, 0, 160, 160)
+          ctx2.fillStyle = 'yellow'; ctx2.fillRect(0, 0, 80, 160)
+        }
+
+        for (const [name, place] of Object.entries(PLACEMENTS)){
+          let src = new Canvas(60, 60), srcCtx = src.getContext('2d')
+          srcCtx.fillStyle = 'red'; srcCtx.fillRect(0, 0, 40, 40)
+          srcCtx.globalCompositeOperation = 'multiply' // target-dependent: eligible for rasterizing
+          srcCtx.fillStyle = 'blue'; srcCtx.fillRect(20, 20, 40, 40)
+
+          let expected = new Canvas(160, 160), expectedCtx = expected.getContext('2d')
+          backdrop(expectedCtx)
+          expectedCtx.save(); place(expectedCtx)
+          expectedCtx.drawImage(await loadImage(src.toBufferSync('png')), 0, 0)
+          expectedCtx.restore()
+
+          let actual = new Canvas(160, 160), actualCtx = actual.getContext('2d')
+          backdrop(actualCtx)
+          actualCtx.save(); place(actualCtx)
+          actualCtx.drawCanvas(src, 0, 0)
+          actualCtx.restore()
+
+          assert.deepEqual(
+            Array.from(actualCtx.getImageData(0, 0, 160, 160).data),
+            Array.from(expectedCtx.getImageData(0, 0, 160, 160).data),
+            `embedding under a ${name} placement should match drawImage of the same canvas`
+          )
+        }
+      })
+
+      test('with non-axis-aligned placements', () => {
+        // Rotated and skewed placements can't resolve to an axis-aligned raster, so they replay the
+        // source's geometry inside a transparency layer with the placement's boundary applied to the
+        // isolated *result*. Clipping the source's ops individually instead attenuates its erasing
+        // composite by the boundary's partial coverage, leaving a fringe of un-erased ink that
+        // accumulates under repeated redraws — so check the erased region after 1 draw and 30.
+        let sprite = () => { // a red square erased to a circle by its own compositing
+          let c = new Canvas(64, 64), x = c.getContext('2d')
+          x.fillStyle = '#f00'; x.fillRect(0, 0, 64, 64)
+          x.globalCompositeOperation = 'destination-in'
+          x.beginPath(); x.arc(32, 32, 24, 0, Math.PI*2); x.fill()
+          return c
+        }
+
+        // maps (x, y) → (ax + cy + e, bx + dy + f), mirroring the ctx.transform() argument order
+        /** @type {Record<string, [number, number, number, number, number, number]>} */
+        const PLACEMENTS = ({
+          'rotate7':  [Math.cos(0.1222), Math.sin(0.1222), -Math.sin(0.1222), Math.cos(0.1222), 30, 20],
+          'rotate45': [Math.SQRT1_2, Math.SQRT1_2, -Math.SQRT1_2, Math.SQRT1_2, 70, 10],
+          'skew':     [1, 0, 0.3, 1, 20, 20],
+        })
+
+        for (const [name, m] of Object.entries(PLACEMENTS)){
+          for (const redraws of [1, 30]){
+            let host = new Canvas(140, 140), ctx2 = host.getContext('2d')
+            ctx2.fillStyle = '#00f'; ctx2.fillRect(0, 0, 140, 140)
+            for (let i = 0; i < redraws; i++){
+              ctx2.save(); ctx2.transform(...m); ctx2.drawCanvas(sprite(), 0, 0); ctx2.restore()
+            }
+
+            // every pixel that lands inside the sprite square but outside the circle (plus an AA
+            // halo) was erased by the sprite's own `destination-in`, so it must still be pure blue
+            let data = ctx2.getImageData(0, 0, 140, 140).data
+            let det = m[0]*m[3] - m[1]*m[2],
+                inv = [m[3]/det, -m[1]/det, -m[2]/det, m[0]/det,
+                      (m[2]*m[5] - m[3]*m[4])/det, (m[1]*m[4] - m[0]*m[5])/det]
+            let worst = 0
+            for (let py = 0; py < 140; py++) for (let px = 0; px < 140; px++){
+              let sx = inv[0]*(px+0.5) + inv[2]*(py+0.5) + inv[4],
+                  sy = inv[1]*(px+0.5) + inv[3]*(py+0.5) + inv[5]
+              if (sx < 1 || sy < 1 || sx > 63 || sy > 63) continue // outside the square (+AA margin)
+              if (Math.hypot(sx - 32, sy - 32) < 30) continue      // inside the circle + AA halo
+              let i = (py*140 + px) * 4
+              worst = Math.max(worst,
+                Math.abs(data[i]) + Math.abs(data[i+1]) + Math.abs(data[i+2] - 255) + Math.abs(data[i+3] - 255))
+            }
+            assert.equal(worst, 0, `the ${name} placement should leave no fringe after ${redraws} draw(s)`)
+          }
+        }
+      })
+    })
+
+    describe("transform()", ()=>{
+      const a=0.1, b=0, c=0, d=0.3, e=0, f=0
+
+      test('with args list', () => {
+        ctx.transform(a, b, c, d, e, f)
+        let matrix = ctx.currentTransform
+        _each({a, b, c, d, e, f}, (val, term) =>
+          assert.nearEqual(matrix[term], val)
+        )
+      })
+
+      test('with DOMMatrix', () => {
+        ctx.transform(new DOMMatrix().scale(0.1, 0.3));
+        let matrix = ctx.currentTransform
+        _each({a, b, c, d, e, f}, (val, term) =>
+          assert.nearEqual(matrix[term], val)
+        )
+      })
+
+      test('with matrix-like object', () => {
+        ctx.transform({a, b, c, d, e, f});
+        let matrix = ctx.currentTransform
+        _each({a, b, c, d, e, f}, (val, term) =>
+          assert.nearEqual(matrix[term], val)
+        )
+      })
+
+      test('with css-style string', () => {
+        // try a range of string inits
+        const transforms = {
+          "matrix(1, 2, 3, 4, 5, 6)": "matrix(1, 2, 3, 4, 5, 6)",
+          "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)": "matrix(1, 0, 0, 1, 0, 0)",
+          "rotate(0.5turn)": "matrix(-1, 0, 0, -1, 0, 0)",
+          "rotate3d(1, 2, 3, 10deg)": "matrix3d(0.985892913511, 0.141398603856, -0.089563373741, 0, -0.137057961859, 0.989148395009, 0.052920390614, 0, 0.096074336736, -0.039898464624, 0.994574197504, 0, 0, 0, 0, 1)",
+          "rotateX(10deg)": "matrix3d(1, 0, 0, 0, 0, 0.984807753012, 0.173648177667, 0, 0, -0.173648177667, 0.984807753012, 0, 0, 0, 0, 1)",
+          "rotateY(10deg)": "matrix3d(0.984807753012, 0, -0.173648177667, 0, 0, 1, 0, 0, 0.173648177667, 0, 0.984807753012, 0, 0, 0, 0, 1)",
+          "rotateZ(10deg)": "matrix(0.984807753012, 0.173648177667, -0.173648177667, 0.984807753012, 0, 0)",
+          "translate(12px, 50px)": "matrix(1, 0, 0, 1, 12, 50)",
+          "translate3d(12px, 50px, 3px)": "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 12, 50, 3, 1)",
+          "translateX(2px)": "matrix(1, 0, 0, 1, 2, 0)",
+          "translateY(3px)": "matrix(1, 0, 0, 1, 0, 3)",
+          "translateZ(2px)": "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 2, 1)",
+          "scale(2, 0.5)": "matrix(2, 0, 0, 0.5, 0, 0)",
+          "scale3d(2.5, 120%, 0.3)": "matrix3d(2.5, 0, 0, 0, 0, 1.2, 0, 0, 0, 0, 0.3, 0, 0, 0, 0, 1)",
+          "scaleX(2)": "matrix(2, 0, 0, 1, 0, 0)",
+          "scaleY(0.5)": "matrix(1, 0, 0, 0.5, 0, 0)",
+          "scaleZ(0.3)": "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0.3, 0, 0, 0, 0, 1)",
+          "skew(30deg, 20deg)": "matrix(1, 0.363970234266, 0.577350269190, 1, 0, 0)",
+          "skewX(30deg)": "matrix(1, 0, 0.577350269190, 1, 0, 0)",
+          "skewY(1.07rad)": "matrix(1, 1.827028196535, 0, 1, 0, 0)",
+          "translate(10px, 20px) matrix(1, 2, 3, 4, 5, 6)": "matrix(1, 2, 3, 4, 15, 26)",
+          "translate(5px, 6px) scale(2) translate(7px,8px)": "matrix(2, 0, 0, 2, 19, 22)",
+          "rotate(30deg) rotate(-.1turn) rotate(.444rad)": "matrix(0.942994450354, 0.332808453321, -0.332808453321, 0.942994450354, 0, 0)",
+          "none": "matrix(1, 0, 0, 1, 0, 0)",
+          "unset": "matrix(1, 0, 0, 1, 0, 0)",
+        }
+
+        for (const input in transforms){
+          let matrix = new DOMMatrix(input),
+              roundtrip = new DOMMatrix(matrix.toString())
+          assert.equal(matrix.toString(), transforms[input])
+          assert.equal(roundtrip.toString(), transforms[input])
+        }
+
+        // check that the context can also take a string
+        ctx.transform(`scale(${a}, ${d})`);
+        let matrix = ctx.currentTransform
+        _each({a, b, c, d, e, f}, (val, term) =>
+          assert.nearEqual(matrix[term], val)
+        )
+      })
+
+      test('rejects invalid args', () => {
+        assert.throws( () => ctx.transform("nonesuch"), /Invalid transform matrix/)
+        // @ts-expect-error — deliberately too few arguments
+        assert.throws( () => ctx.transform(0, 0, 0), /not enough arguments/)
+        assert.doesNotThrow( () => ctx.transform(0, 0, 0, NaN, 0, 0))
+      })
+
+    })
+
+
+    describe("wide-gamut color", () => {
+
+      test('fillStyle', () => {
+        // a color() fill outside the sRGB gamut survives to a display-p3 surface losslessly…
+        let p3 = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+        p3.fillStyle = 'color(display-p3 1 0 0)'
+        p3.fillRect(0, 0, 4, 4)
+        assert.deepEqual(Array.from(p3.getImageData(0, 0, 1, 1).data), [255, 0, 0, 255])
+
+        // …while an srgb surface clamps it at draw time
+        let srgb = new Canvas(4, 4).getContext('2d')
+        srgb.fillStyle = 'color(display-p3 1 0 0)'
+        srgb.fillRect(0, 0, 4, 4)
+        assert.deepEqual(Array.from(srgb.getImageData(0, 0, 1, 1).data), [255, 0, 0, 255])
+        assert.deepEqual(Array.from(srgb.getImageData(0, 0, 1, 1, {colorSpace:'display-p3'}).data), [234, 51, 35, 255])
+
+        // the same read on an untouched canvas: the surface it rasterizes into has to be built in
+        // the *canvas's* space, not the one being read back, or the clamp above never happens and
+        // the p3 red survives to hand back an unconverted [255, 0, 0]. reading in the other order
+        // hides that, since the read above leaves a correctly-spaced surface behind to reuse
+        let cold = new Canvas(4, 4).getContext('2d')
+        cold.fillStyle = 'color(display-p3 1 0 0)'
+        cold.fillRect(0, 0, 4, 4)
+        assert.deepEqual(Array.from(cold.getImageData(0, 0, 1, 1, {colorSpace:'display-p3'}).data), [234, 51, 35, 255])
+      })
+
+      test('CanvasGradient stops', () => {
+        let p3 = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'}),
+            grad = p3.createLinearGradient(0, 0, 4, 0)
+        grad.addColorStop(0, 'color(display-p3 1 0 0)')
+        grad.addColorStop(1, 'color(display-p3 1 0 0)')
+        p3.fillStyle = grad
+        p3.fillRect(0, 0, 4, 4)
+        assert.deepEqual(Array.from(p3.getImageData(0, 0, 1, 1).data), [255, 0, 0, 255])
+      })
+
+      test('CanvasTexture', () => {
+        // a texture drawn in an out-of-sRGB color survives on a display-p3 surface
+        let p3 = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+        p3.fillStyle = p3.createTexture(4, {line:8, color:'color(display-p3 1 0 0)'})
+        p3.fillRect(0, 0, 4, 4)
+        assert.deepEqual(Array.from(p3.getImageData(1, 1, 1, 1).data), [255, 0, 0, 255])
+      })
+
+      test('auxiliary colors', async () => {
+        // shadows cast in wide-gamut colors survive on a display-p3 surface
+        let p3 = new Canvas(8, 8).getContext('2d', {colorSpace:'display-p3'})
+        p3.shadowColor = 'color(display-p3 1 0 0)'
+        assert.equal(p3.shadowColor, 'color(display-p3 1 0 0)')
+        p3.shadowOffsetX = 4
+        p3.fillStyle = 'black'
+        p3.fillRect(0, 2, 2, 2) // shadow lands at x:4-6
+        assert.deepEqual(Array.from(p3.getImageData(5, 3, 1, 1).data), [255, 0, 0, 255])
+
+        // …as do matte backgrounds
+        let blank = new Canvas(4, 4)
+        blank.getContext('2d', {colorSpace:'display-p3'})
+        let raw = await blank.toBuffer('raw', {matte:'color(display-p3 1 0 0)'})
+        assert.deepEqual(Array.from(raw.slice(0, 4)), [255, 0, 0, 255])
+
+        // …and drop-shadow() filter colors
+        let f = new Canvas(8, 8).getContext('2d', {colorSpace:'display-p3'})
+        f.filter = 'drop-shadow(4px 0px 0px color(display-p3 1 0 0))'
+        f.fillStyle = 'black'
+        f.fillRect(0, 2, 2, 2)
+        assert.deepEqual(Array.from(f.getImageData(5, 3, 1, 1).data), [255, 0, 0, 255])
+      })
+
+      test('drawImage(canvas)', async () => {
+        // a source canvas holding an out-of-sRGB-gamut fill…
+        let srcCanvas = new Canvas(4, 4),
+            src = srcCanvas.getContext('2d')
+        src.fillStyle = 'color(display-p3 1 0 0)'
+        src.fillRect(0, 0, 4, 4)
+
+        // …is clamped to that canvas's own gamut when drawImage() snapshots it, since drawImage()
+        // takes the source *as a bitmap*. The intermediate raster is built in the source page's
+        // space at 8 bits — the same surface a readback or an export rasterizes into — so all three
+        // ways of asking what the source holds agree. An extended-range (F16) intermediate would
+        // instead carry the p3 red into whatever space drawImage() is compositing into, leaving one
+        // canvas reporting two different reds depending on which door you used.
+        let viaImage = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+        viaImage.drawImage(srcCanvas, 0, 0)
+        assert.deepEqual(Array.from(viaImage.getImageData(0, 0, 1, 1).data), [234, 51, 35, 255])
+
+        // …which is what the source reports for itself, and what round-tripping it through its own
+        // PNG export and back yields
+        assert.deepEqual(Array.from(src.getImageData(0, 0, 1, 1, {colorSpace:'display-p3'}).data), [234, 51, 35, 255])
+        let viaPNG = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+        viaPNG.drawImage(await loadImage(srcCanvas.toBufferSync('png')), 0, 0)
+        assert.deepEqual(Array.from(viaPNG.getImageData(0, 0, 1, 1).data), [234, 51, 35, 255])
+
+        // drawCanvas() agrees, by a different route: rather than snapshotting the source it
+        // renders it into its own colorspace on the way in (see 'drawCanvas()')
+        let viaCanvas = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+        viaCanvas.drawCanvas(srcCanvas, 0, 0)
+        assert.deepEqual(Array.from(viaCanvas.getImageData(0, 0, 1, 1).data), [234, 51, 35, 255])
+
+        // …and so does using the source as a pattern. this one is not a snapshot at all: the tile
+        // stays a Picture (so it re-rasterizes at whatever scale it's drawn) and skia rasterizes
+        // that tile in the *destination's* space, which would alias the p3 red straight through.
+        // declaring the source's gamut as the shader's working space is what converts it instead.
+        let viaPattern = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+        viaPattern.fillStyle = viaPattern.createPattern(srcCanvas, 'repeat')
+        viaPattern.fillRect(0, 0, 4, 4)
+        assert.deepEqual(Array.from(viaPattern.getImageData(0, 0, 1, 1).data), [234, 51, 35, 255])
+      })
+
+      test('drawCanvas()', () => {
+        // a page's colorSpace bounds its content, so an embed lands in the destination clamped to
+        // the *source's* gamut — the same pixels getImageData and its own png report. the clamp is
+        // a property of the page, not of any one kind of content, so it can't be sidestepped by
+        // routing the out-of-gamut color in as something other than a paint
+        const CLAMPED = [234, 51, 35, 255] // p3 red, reduced to the sRGB gamut the source declared
+
+        let p3red = new Canvas(4, 4)
+        p3red.getContext('2d', {colorSpace:'display-p3'}).fillStyle = 'color(display-p3 1 0 0)'
+        p3red.getContext('2d').fillRect(0, 0, 4, 4)
+
+        let routes = {
+          paint: src => { src.fillStyle = 'color(display-p3 1 0 0)'; src.fillRect(0, 0, 4, 4) },
+          embed: src => src.drawCanvas(p3red, 0, 0),
+          pixels: src => {
+            let data = src.createImageData(4, 4, {colorSpace:'display-p3'})
+            for (let i=0; i<data.data.length; i+=4){ data.data[i] = 255; data.data[i+3] = 255 }
+            src.putImageData(data, 0, 0)
+          },
+        }
+
+        for (const [name, draw] of Object.entries(routes)){
+          let srcCanvas = new Canvas(4, 4)
+          draw(srcCanvas.getContext('2d')) // an sRGB source, however the color got into it
+          let dst = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+          dst.drawCanvas(srcCanvas, 0, 0)
+          assert.deepEqual(Array.from(dst.getImageData(1, 1, 1, 1).data), CLAMPED, name)
+        }
+
+        // the clamp can't depend on which replay path the embed takes, or cache state and placement
+        // angle would be visible in the output. a `dependent_ops` source resolves to a cached
+        // raster; a plain one and a rotated one replay their geometry instead
+        let srcCanvas = new Canvas(4, 4),
+            src = srcCanvas.getContext('2d')
+        src.fillStyle = 'color(display-p3 1 0 0)'
+        src.fillRect(0, 0, 4, 4)
+
+        let dependent = new Canvas(4, 4), dep = dependent.getContext('2d')
+        dep.drawCanvas(srcCanvas, 0, 0)
+        dep.globalCompositeOperation = 'destination-in'
+        dep.fillRect(0, 0, 4, 4) // full coverage: erases nothing, but marks the page dependent
+
+        for (const source of [srcCanvas, dependent]){
+          let upright = new Canvas(4, 4).getContext('2d', {colorSpace:'display-p3'})
+          upright.drawCanvas(source, 0, 0)
+          assert.deepEqual(Array.from(upright.getImageData(1, 1, 1, 1).data), CLAMPED)
+
+          let turned = new Canvas(8, 8).getContext('2d', {colorSpace:'display-p3'})
+          turned.translate(4, 0)
+          turned.rotate(Math.PI / 4) // never resolves to a raster, so it always replays
+          turned.drawCanvas(source, 0, 0)
+          assert.deepEqual(Array.from(turned.getImageData(4, 2, 1, 1).data), CLAMPED)
+        }
+
+        // …and a destination no wider than the source needs no mapping at all
+        let srgb = new Canvas(4, 4).getContext('2d')
+        srgb.drawCanvas(srcCanvas, 0, 0)
+        assert.deepEqual(Array.from(srgb.getImageData(1, 1, 1, 1).data), [255, 0, 0, 255])
+      })
+    })
+  })
+
+  describe("parses", () => {
+    test('fonts', () => {
+      let cases = {
+        '20px Arial': { size: 20, family: ['Arial'] },
+        '33pt Arial': { size: 44, family: ['Arial'] },
+        '75pt Arial': { size: 100, family: ['Arial'] },
+        '20% Arial': { size: 16 * 0.2, family:['Arial'] },
+        '20mm Arial': { size: 75.59055118110237, family: ['Arial'] },
+        '20px serif': { size: 20, family: ['serif'] },
+        '20px sans-serif': { size: 20, family: ['sans-serif'] },
+        '20px monospace': { size: 20, family: ['monospace'] },
+        '50px Arial, sans-serif': { size: 50, family: ['Arial','sans-serif'] },
+        'bold italic 50px Arial, sans-serif': { style: 'italic', weight: 700, size: 50, family: ['Arial','sans-serif'] },
+        '50px Helvetica ,  Arial, sans-serif': { size: 50, family: ['Helvetica','Arial','sans-serif'] },
+        '50px "Helvetica Neue", sans-serif': { size: 50, family: ['Helvetica Neue','sans-serif'] },
+        '50px "Helvetica Neue", "foo bar baz" , sans-serif': { size: 50, family: ['Helvetica Neue','foo bar baz','sans-serif'] },
+        "50px 'Helvetica Neue'": { size: 50, family: ['Helvetica Neue'] },
+        'italic 20px Arial': { size: 20, style: 'italic', family: ['Arial'] },
+        'oblique 20px Arial': { size: 20, style: 'oblique', family: ['Arial'] },
+        'normal 20px Arial': { size: 20, style: 'normal', family: ['Arial'] },
+        '300 20px Arial': { size: 20, weight: 300, family: ['Arial'] },
+        '800 20px Arial': { size: 20, weight: 800, family: ['Arial'] },
+        'bolder 20px Arial': { size: 20, weight: 800, family: ['Arial'] },
+        'lighter 20px Arial': { size: 20, weight: 300, family: ['Arial'] },
+        'normal normal normal 16px Impact': { size: 16, weight: 400, family: ['Impact'], style: 'normal', variant: 'normal' },
+        'italic small-caps bolder 16px cursive': { size: 16, style: 'italic', variant: 'small-caps', weight: 800, family: ['cursive'] },
+        // `normal` is a no-op token in the shorthand: it must not cancel a sub-property that a
+        // preceding (or following) keyword already set — regression guards for #278.
+        'italic normal 20px Arial': { size: 20, style: 'italic', family: ['Arial'] },
+        'bold normal 20px Arial': { size: 20, weight: 700, family: ['Arial'] },
+        'small-caps normal 20px Arial': { size: 20, variant: 'small-caps', family: ['Arial'] },
+        'oblique normal 20px Arial': { size: 20, style: 'oblique', family: ['Arial'] },
+        'normal italic 20px Arial': { size: 20, style: 'italic', family: ['Arial'] }, // normal before the keyword
+        'italic normal bold 20px Arial': { size: 20, style: 'italic', weight: 700, family: ['Arial'] }, // normal wedged between two
+        // upper bound of the numeric weight range (1–1000)
+        '1000 20px Arial': { size: 20, weight: 1000, family: ['Arial'] },
+        // line-height component (`size/line-height`), incl. the `normal` (1.2×) keyword
+        '16px/1.5 Arial': { size: 16, lineHeight: 24, family: ['Arial'] },
+        '16px/normal Arial': { size: 16, lineHeight: 19.2, family: ['Arial'] },
+        // font-stretch: intentionally supported beyond Chrome's canvas (which silently drops it)
+        'condensed 20px Arial': { size: 20, stretch: 'condensed', family: ['Arial'] },
+        'italic small-caps 300 condensed 20px Arial': { size: 20, style: 'italic', variant: 'small-caps', weight: 300, stretch: 'condensed', family: ['Arial'] },
+        '20px "new century schoolbook", serif': { size: 20, family: ['new century schoolbook','serif'] },
+        '20px "Arial bold 300"': { size: 20, family: ['Arial bold 300'], variant: 'normal' }, // synthetic case with weight keyword inside family
+        '+12px Arial': { size: 12, family: ['Arial'] }, // a leading sign is valid CSS
+        'italic\n16px\nArial': { size: 16, style: 'italic', family: ['Arial'] },
+        'bold\n50px\nArial,\nsans-serif': { size: 50, weight: 700, family: ['Arial','sans-serif'] },
+      }
+
+      _each(cases, (spec, font) => {
+        let expected = {style:"normal", stretch:"normal", variant:"normal", ...spec},
+            parsed = css.font(font);
+        assert.matchesSubset(parsed, expected)
+      })
+
+      // a size has to be a complete CSS number + unit (or a bare keyword): trailing junk,
+      // malformed decimals, and keywords with characters glued on invalidate the shorthand
+      for (let bad of ['12pxjunk Arial', '1.2.3px Arial', '5.px Arial', 'junkmedium Arial',
+                       'mediumjunk Arial', '16px/12pxjunk Arial',
+                       // `ex` & `ch` need font metrics the parsers can't see, so they're rejected
+                       // rather than approximated (a no-op here; a TypeError under strict mode)
+                       '2ex Arial', '2ch Arial']){
+        assert.equal(css.font(bad), null, `"${bad}" should be rejected`)
+      }
+    })
+
+    test('textDecoration', () => {
+      let cases = {
+        'underline':                  { line: 'underline', style: 'solid',  color: 'currentColor' },
+        'overline dashed':            { line: 'overline',  style: 'dashed', color: 'currentColor' },
+        'wavy line-through lime':     { line: 'line-through', style: 'wavy',   color: 'lime' },
+        'underline from-font':        { line: 'underline', inherit: 'from-font' },
+        'underline 2px blue':         { line: 'underline', thickness: { size: 2, unit: 'px', px: 2 }, color: 'blue' },
+        'underline\ndotted\nred':     { line: 'underline', style: 'dotted', color: 'red' },
+        'wavy\t3px\tunderline\tblue': { line: 'underline', style: 'wavy', color: 'blue', thickness: { size: 3, unit: 'px', px: 3 } },
+      }
+
+      _each(cases, (spec, decoration) => {
+        assert.matchesSubset(css.decoration(decoration), spec)
+      })
+
+      // a multiline value must parse identically to its single-line equivalent
+      assert.deepEqual(
+        css.decoration('underline\ndotted\nred'),
+        css.decoration('underline dotted red')
+      )
+    })
+
+    test('mixed case', () => {
+      // keywords, units & function names in CSS-derived values are case-insensitive (and read back
+      // in lowercase), but family names & OpenType tags keep their case
+      assert.matchesSubset(css.font('BOLD Italic Small-Caps Condensed 12PT/1.5EM Serif'), {
+        weight: 700, style: 'italic', variant: 'small-caps', stretch: 'condensed', size: 16, lineHeight: 24, family: ['serif']
+      })
+      assert.deepEqual(css.font('16px ARIAL, "Serif", SANS-SERIF').family, ['ARIAL', 'Serif', 'sans-serif'])
+
+      ctx.letterSpacing = '2PX'
+      assert.equal(ctx.letterSpacing, '2px')
+      ctx.wordSpacing = '0.5EM'
+      assert.equal(ctx.wordSpacing, '0.5em')
+      ctx.fontVariant = 'Small-Caps Styleset(3)'
+      assert.equal(ctx.fontVariant, 'small-caps styleset(3)')
+      ctx.filter = 'BLUR(2PX) Drop-Shadow(1PX 2PX RED)'
+      assert.equal(ctx.filter, 'blur(2px) drop-shadow(1px 2px red)')
+      ctx.filter = 'None'
+      assert.equal(ctx.filter, 'none')
+      ctx.fontFeatureSettings = '"liga" OFF'
+      assert.equal(ctx.fontFeatureSettings, '"liga" 0')
+      ctx.fontFeatureSettings = 'NORMAL'
+      assert.equal(ctx.fontFeatureSettings, 'normal')
+      ctx.fontFeatureSettings = '"LIGA" 0'
+      assert.equal(ctx.fontFeatureSettings, '"LIGA" 0')
+      ctx.textDecoration = 'UNDERLINE Wavy RED'
+      assert.equal(ctx.textDecoration, 'underline wavy red')
+
+      // currentColor is a keyword too, so every spelling draws the rule in the fill color
+      FontLibrary.use('CaseFace', [`tests/assets/fonts/montserrat-latin/montserrat-v30-latin-regular.woff2`])
+      let underlined = (deco) => {
+        ctx.reset()
+        ctx.font = '20px CaseFace'
+        ctx.fillStyle = 'blue'
+        ctx.textDecoration = `underline ${deco}`
+        ctx.fillText('xx', 10, 30)
+        return ctx.getImageData(0, 0, 60, 40).data
+      }
+      let blue = underlined('blue')
+      assert.notDeepEqual(underlined('red'), blue)
+      for (let spelling of ['currentColor', 'currentcolor', 'CURRENTCOLOR']){
+        assert.deepEqual(underlined(spelling), blue, `"${spelling}" should draw in the fill color`)
+      }
+    })
+
+    test('colors', () => {
+      ctx.fillStyle = '#ffccaa';
+      assert.equal(ctx.fillStyle, '#ffccaa');
+
+      ctx.fillStyle = '#FFCCAA';
+      assert.equal(ctx.fillStyle, '#ffccaa');
+
+      ctx.fillStyle = '#FCA';
+      assert.equal(ctx.fillStyle, '#ffccaa');
+
+      ctx.fillStyle = '#0ff';
+      ctx.fillStyle = '#FGG';
+      assert.equal(ctx.fillStyle, '#00ffff');
+
+      ctx.fillStyle = '#fff';
+      ctx.fillStyle = 'afasdfasdf';
+      assert.equal(ctx.fillStyle, '#ffffff');
+
+      // #rgba and #rrggbbaa
+
+      ctx.fillStyle = '#ffccaa80'
+      assert.equal(ctx.fillStyle, 'rgba(255, 204, 170, 0.502)')
+
+      ctx.fillStyle = '#acf8'
+      assert.equal(ctx.fillStyle, 'rgba(170, 204, 255, 0.533)')
+
+      ctx.fillStyle = '#BEAD'
+      assert.equal(ctx.fillStyle, 'rgba(187, 238, 170, 0.867)')
+
+      ctx.fillStyle = 'rgb(255,255,255)';
+      assert.equal(ctx.fillStyle, '#ffffff');
+
+      ctx.fillStyle = 'rgb(0,0,0)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      ctx.fillStyle = 'rgb( 0  ,   0  ,  0)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      ctx.fillStyle = 'rgba( 0  ,   0  ,  0, 1)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      ctx.fillStyle = 'rgba( 255, 200, 90, 0.5)';
+      assert.equal(ctx.fillStyle, 'rgba(255, 200, 90, 0.5)');
+
+      ctx.fillStyle = 'rgba( 255, 200, 90, 0.75)';
+      assert.equal(ctx.fillStyle, 'rgba(255, 200, 90, 0.75)');
+
+      ctx.fillStyle = 'rgba( 255, 200, 90, 0.7555)';
+      assert.equal(ctx.fillStyle, 'rgba(255, 200, 90, 0.756)');
+
+      ctx.fillStyle = 'rgba( 255, 200, 90, .7555)';
+      assert.equal(ctx.fillStyle, 'rgba(255, 200, 90, 0.756)');
+
+      ctx.fillStyle = 'rgb(0, 0, 9000)';
+      assert.equal(ctx.fillStyle, '#0000ff');
+
+      ctx.fillStyle = 'rgba(0, 0, 0, 42.42)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      // hsl / hsla tests
+
+      ctx.fillStyle = 'hsl(0, 0%, 0%)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      ctx.fillStyle = 'hsl(3600, -10%, -10%)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      ctx.fillStyle = 'hsl(10, 100%, 42%)';
+      assert.equal(ctx.fillStyle, '#d62400');
+
+      ctx.fillStyle = 'hsl(370, 120%, 42%)';
+      assert.equal(ctx.fillStyle, '#d62400');
+
+      ctx.fillStyle = 'hsl(0, 100%, 100%)';
+      assert.equal(ctx.fillStyle, '#ffffff');
+
+      ctx.fillStyle = 'hsl(0, 150%, 150%)';
+      assert.equal(ctx.fillStyle, '#ffffff');
+
+      ctx.fillStyle = 'hsl(237, 76%, 25%)';
+      assert.equal(ctx.fillStyle, '#0f1470');
+
+      ctx.fillStyle = 'hsl(240, 73%, 25%)';
+      assert.equal(ctx.fillStyle, '#11116e');
+
+      ctx.fillStyle = 'hsl(262, 32%, 42%)';
+      assert.equal(ctx.fillStyle, '#62498d');
+
+      ctx.fillStyle = 'hsla(0, 0%, 0%, 1)';
+      assert.equal(ctx.fillStyle, '#000000');
+
+      ctx.fillStyle = 'hsla(0, 100%, 100%, 1)';
+      assert.equal(ctx.fillStyle, '#ffffff');
+
+      ctx.fillStyle = 'hsla(120, 25%, 75%, 0.5)';
+      assert.equal(ctx.fillStyle, 'rgba(175, 207, 175, 0.5)');
+
+      ctx.fillStyle = 'hsla(240, 75%, 25%, 0.75)';
+      assert.equal(ctx.fillStyle, 'rgba(16, 16, 112, 0.75)');
+
+      ctx.fillStyle = 'hsla(172.0, 33.00000e0%, 42%, 1)';
+      assert.equal(ctx.fillStyle, '#488e85');
+
+      ctx.fillStyle = 'hsl(124.5, 76.1%, 47.6%)';
+      assert.equal(ctx.fillStyle, '#1dd62b');
+
+      ctx.fillStyle = 'hsl(1.24e2, 760e-1%, 4.7e1%)';
+      assert.equal(ctx.fillStyle, '#1dd329');
+
+      // CSS Color 4 syntaxes (parsed in full; non-legacy forms serialize canonically, not as hex)
+
+      ctx.fillStyle = 'color(srgb 0.5 0.25 1)'
+      assert.equal(ctx.fillStyle, 'color(srgb 0.5 0.25 1)')
+      ctx.fillRect(0, 0, 1, 1)
+      assert.deepEqual(pixel(0, 0), [128, 64, 255, 255])
+
+      ctx.fillStyle = 'color(display-p3 0.5 0.5 0.5)' // achromatic values are gamut-neutral
+      assert.equal(ctx.fillStyle, 'color(display-p3 0.5 0.5 0.5)')
+      ctx.fillRect(0, 0, 1, 1)
+      assert.deepEqual(pixel(0, 0), [128, 128, 128, 255])
+
+      ctx.fillStyle = 'color(display-p3 1 0 0)' // P3 red clamps to the sRGB gamut's edge when drawn
+      assert.equal(ctx.fillStyle, 'color(display-p3 1 0 0)')
+      ctx.fillRect(0, 0, 1, 1)
+      assert.deepEqual(pixel(0, 0), [255, 0, 0, 255])
+
+      ctx.fillStyle = 'color(srgb 1 none 0)' // `none` components are treated as 0 when drawing
+      assert.equal(ctx.fillStyle, 'color(srgb 1 none 0)')
+      ctx.fillRect(0, 0, 1, 1)
+      assert.deepEqual(pixel(0, 0), [255, 0, 0, 255])
+
+      ctx.fillStyle = 'oklch(100% 0 0)'
+      assert.equal(ctx.fillStyle, 'oklch(1 0 0)')
+      ctx.fillRect(0, 0, 1, 1)
+      assert.deepEqual(pixel(0, 0), WHITE)
+
+      ctx.fillStyle = 'lab(0% 0 0)'
+      assert.equal(ctx.fillStyle, 'lab(0 0 0)')
+      ctx.fillRect(0, 0, 1, 1)
+      assert.deepEqual(pixel(0, 0), BLACK)
+
+      ctx.fillStyle = 'oklab(1 0 0 / 0.5)'
+      assert.equal(ctx.fillStyle, 'oklab(1 0 0 / 0.5)')
+
+      // not-yet-supported syntax is ignored like any other invalid value
+
+      ctx.fillStyle = '#8040ff'
+      ctx.fillStyle = 'rgb(from rebeccapurple r g b)' // relative color syntax
+      assert.equal(ctx.fillStyle, '#8040ff')
+
+      ctx.fillStyle = 'currentcolor'
+      assert.equal(ctx.fillStyle, '#8040ff')
+
+      // case-insensitive css names
+
+      ctx.fillStyle = "sILveR";
+      assert.equal(ctx.fillStyle, "#c0c0c0");
+
+      // wrong type args
+
+      let transparent = 'rgba(0, 0, 0, 0)'
+      ctx.fillStyle = 'transparent'
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = null
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = NaN
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = [undefined, 255, false]
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = true
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = {}
+      assert.equal(ctx.fillStyle, transparent);
+
+      // objects with .toString methods
+
+      ctx.fillStyle = {toString:() => 'red'}
+      assert.equal(ctx.fillStyle, '#ff0000');
+
+      ctx.fillStyle = 'transparent'
+      ctx.fillStyle = {toString:'red'}
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = {toString:() => 'gobbledygook'}
+      assert.equal(ctx.fillStyle, transparent);
+
+      ctx.fillStyle = {toString:() => NaN}
+      assert.equal(ctx.fillStyle, transparent);
+
+    });
+  })
+
+  describe("validates", () => {
+    let g, id, img, p2d
+    /** @type {any} */
+    let lax // deliberately-invalid calls are routed through this untyped alias
+    beforeEach(async () => {
+      lax = ctx
+      g = ctx.createLinearGradient(0,0,10,10)
+      id = ctx.getImageData(0,0,10,10)
+      img = await loadAsset("checkers.png")
+      p2d = new Path2D()
+      p2d.rect(0,0,100,100)
+      ctx.rect(0,0,100,100)
+    })
+
+    test('not enough arguments', async () => {
+      let ERR =  /not enough arguments/
+      assert.throws(() => lax.transform(), ERR)
+      assert.throws(() => lax.transform(0,0,0,0,0), ERR)
+      assert.throws(() => lax.setTransform(0,0,0,0,0), ERR)
+      assert.throws(() => lax.translate(0), ERR)
+      assert.throws(() => lax.scale(0), ERR)
+      assert.throws(() => lax.rotate(), ERR)
+      assert.throws(() => lax.rect(0,0,0), ERR)
+      assert.throws(() => lax.arc(0,0,0,0), ERR)
+      assert.throws(() => lax.arcTo(0,0,0,0), ERR)
+      assert.throws(() => lax.ellipse(0,0,0,0,0,0), ERR)
+      assert.throws(() => lax.moveTo(0), ERR)
+      assert.throws(() => lax.lineTo(0), ERR)
+      assert.throws(() => lax.bezierCurveTo(0,0,0,0,0), ERR)
+      assert.throws(() => lax.quadraticCurveTo(0,0,0), ERR)
+      assert.throws(() => lax.conicCurveTo(0,0,0,0), ERR)
+      assert.throws(() => lax.roundRect(0,0,0), ERR)
+      assert.throws(() => lax.fillRect(0,0,0), ERR)
+      assert.throws(() => lax.strokeRect(0,0,0), ERR)
+      assert.throws(() => lax.clearRect(0,0,0), ERR)
+      assert.throws(() => lax.fillText("text",0), ERR)
+      assert.throws(() => lax.isPointInPath(10), ERR)
+      assert.throws(() => lax.isPointInStroke(10), ERR)
+      assert.throws(() => lax.createLinearGradient(0,0,1), ERR)
+      assert.throws(() => lax.createRadialGradient(0,0,0,0,0), ERR)
+      assert.throws(() => lax.createConicGradient(0,0), ERR)
+      assert.throws(() => lax.setLineDash(), ERR)
+      assert.throws(() => lax.createImageData(), ERR)
+      assert.throws(() => lax.createPattern(img), ERR)
+      assert.throws(() => lax.createTexture(), ERR)
+      assert.throws(() => lax.getImageData(1,1,10), ERR)
+      assert.throws(() => lax.putImageData({},0), ERR)
+      assert.throws(() => lax.putImageData(id,0,0,0,0,0), ERR)
+      assert.throws(() => lax.drawImage(img), ERR)
+      assert.throws(() => lax.drawImage(img,0), ERR)
+      assert.throws(() => lax.drawImage(img,0,0,0), ERR)
+      assert.throws(() => lax.drawImage(img,0,0,0,0,0), ERR)
+      assert.throws(() => lax.drawImage(img,0,0,0,0,0,0), ERR)
+      assert.throws(() => lax.drawImage(img,0,0,0,0,0,0,0), ERR)
+      assert.throws(() => lax.drawCanvas(canvas), ERR)
+      assert.throws(() => lax.drawCanvas(canvas,0), ERR)
+      assert.throws(() => lax.drawCanvas(canvas,0,0,0), ERR)
+      assert.throws(() => lax.drawCanvas(canvas,0,0,0,0,0), ERR)
+      assert.throws(() => lax.drawCanvas(canvas,0,0,0,0,0,0), ERR)
+      assert.throws(() => lax.drawCanvas(canvas,0,0,0,0,0,0,0), ERR)
+      assert.throws(() => g.addColorStop(0), ERR)
+    })
+
+    test('value errors', async () => {
+      assert.throws(() => ctx.arc(0,0,-10,0,0), {name:'IndexSizeError'})
+      assert.throws(() => ctx.ellipse(0,0,-10,-10,0,0,0,false), {name:'IndexSizeError'})
+      assert.throws(() => ctx.arcTo(0,0,0,0,-10), {name:'IndexSizeError'})
+      assert.throws(() => ctx.roundRect(0,0,0,0,-10), /Corner radius cannot be negative/)
+      assert.throws(() => ctx.createImageData(1,0), /Dimensions must be non-zero/)
+      assert.throws(() => ctx.getImageData(1,1,NaN,10), /Expected a number/)
+      assert.throws(() => ctx.getImageData(1,NaN,10,10), /Expected a number/)
+      assert.throws(() => lax.createImageData(1,{}), /Dimensions must be non-zero/)
+      assert.throws(() => ctx.createImageData(1,NaN), /Dimensions must be non-zero/)
+      assert.throws(() => ctx.putImageData(id,NaN,0), /Expected a number/)
+      assert.throws(() => ctx.putImageData(id,0,0,0,0,NaN,0), /Expected a number for `dirtyWidth`/)
+      assert.throws(() => lax.putImageData({},0,0), /Expected an ImageData as 1st arg/)
+      assert.throws(() => lax.drawImage(), /Expected an Image, Canvas, or CanvasRenderingContext2D/)
+      assert.throws(() => lax.drawCanvas(), /Expected an Image, Canvas, or CanvasRenderingContext2D/)
+      assert.throws(() => lax.fill(NaN), /Expected `fillRule`/)
+      assert.throws(() => lax.clip(NaN), /Expected `fillRule`/)
+      assert.throws(() => lax.stroke(NaN), /Expected a Path2D/)
+      assert.throws(() => lax.fill(NaN, "evenodd"), /Expected a Path2D/)
+      assert.throws(() => lax.clip(NaN, "evenodd"), /Expected a Path2D/)
+      assert.throws(() => lax.fill(p2d, {}), /Expected `fillRule`/)
+      assert.throws(() => ctx.createTexture([1, NaN]), /Expected a number or array/)
+      assert.throws(() => ctx.createTexture(1, {path:null}), /Expected a Path2D/)
+      assert.throws(() => lax.createTexture(20, {line:{}}), /Expected a number for `line`/)
+      assert.throws(() => lax.createTexture(20, {angle:{}}), /Expected a number for `angle`/)
+      assert.throws(() => lax.createTexture(20, {offset:{}}), /Expected a number or array/)
+      assert.throws(() => lax.createTexture(20, {cap:{}}), /Expected \"butt\", \"square\"/) // stringified to "[object Object]"
+      assert.throws(() => lax.createTexture(20, {cap:""}), /Expected \"butt\", \"square\"/)
+      assert.throws(() => ctx.createTexture(20, {offset:[1, NaN]}), /Expected a number or array/)
+      assert.throws(() => lax.isPointInPath(0, 10, 10), /Expected `fillRule`/)
+      assert.throws(() => lax.isPointInPath(false, 10, 10), /Expected `fillRule`/)
+      assert.throws(() => lax.isPointInPath({}, 10, 10), /Expected `fillRule`/)
+      assert.throws(() => lax.isPointInPath({}, 10, 10, "___"), /Expected a Path2D/)
+      assert.throws(() => lax.isPointInPath({}, 10, 10, "evenodd"), /Expected a Path2D/)
+      assert.throws(() => lax.isPointInPath(10, 10, "___"), /Expected `fillRule`/)
+      assert.throws(() => lax.isPointInPath(p2d, 10, 10, ""), /Expected `fillRule`/)
+      assert.throws(() => ctx.createLinearGradient(0,0,NaN,1), /Expected a number for/)
+      assert.throws(() => ctx.createRadialGradient(0,0,NaN,0,0,0), /Expected a number for/)
+      assert.throws(() => ctx.createConicGradient(0,NaN,0), /Expected a number for/)
+      // @ts-expect-error — deliberately invalid repetition value
+      assert.throws(() => ctx.createPattern(img, "___"), {name:'SyntaxError', message:/Expected `repetition`/})
+      assert.throws(() => g.addColorStop(NaN, '#000'), /Expected a number/)
+      assert.throws(() => g.addColorStop(0, {}), /Could not be parsed as a color/)
+      assert.throws(() => lax.setLineDash(NaN), /Value is not a sequence/)
+    })
+
+    test('non-string values', async () => {
+      // string attributes stringify whatever they're given (as WebIDL does), so values that
+      // stringify to something valid are applied, and anything else is silently ignored
+      let valid = {lineCap:'round', textAlign:'center', globalCompositeOperation:'multiply', font:'20px serif',
+                   filter:'blur(2px)', fontVariant:'small-caps', letterSpacing:'2px', textDecoration:'underline'}
+      for (let [prop, val] of Object.entries(valid)){
+        lax.reset()
+        let initial = lax[prop]
+        lax[prop] = val
+        let applied = lax[prop]
+
+        for (let junk of [5, null, undefined, {}]){
+          lax.reset()
+          assert.doesNotThrow(() => lax[prop] = junk, `${prop} = ${junk}`)
+          assert.equal(lax[prop], initial, `${prop} = ${junk} should be ignored`)
+        }
+        for (let wrapped of [new String(val), {toString: () => val}, [val]]){
+          lax.reset()
+          lax[prop] = wrapped
+          assert.equal(lax[prop], applied, `${prop} = ${typeof wrapped} should apply`)
+        }
+      }
+      assert.throws(() => lax.lineCap = Symbol('round'), /Cannot convert a Symbol/)
+
+      // string-taking methods stringify their arguments too (then validate them as usual)
+      let square = new Path2D()
+      square.rect(0, 0, 10, 10)
+      assert.ok(lax.createPattern(canvas, new String('repeat-x')))
+      assert.throws(() => lax.createPattern(canvas, 5), {name:'SyntaxError'})
+      assert.equal(lax.isPointInPath(square, 5, 5, new String('evenodd')), true)
+      assert.ok(lax.createTexture(10, {cap: {toString: () => 'round'}}))
+      assert.doesNotThrow(() => lax.fill(new String('evenodd')))
+      assert.doesNotThrow(() => lax.clip({toString: () => 'evenodd'}))
+      assert.throws(() => lax.fill(null), /Expected `fillRule`/) // as in browsers
+      let pixels = lax.getImageData(0, 0, 1, 1, {colorSpace: new String('display-p3'), colorType: new String('bgra')})
+      assert.equal(pixels.colorSpace, 'display-p3')
+      assert.equal(pixels.colorType, 'bgra')
+    })
+
+    test('NaN arguments', async () => {
+      // silently fail
+      assert.doesNotThrow(() => lax.setTransform({}))
+      assert.doesNotThrow(() => ctx.setTransform(0,0,0,NaN,0,0))
+      assert.doesNotThrow(() => ctx.translate(NaN,0))
+      assert.doesNotThrow(() => ctx.scale(NaN,0))
+      assert.doesNotThrow(() => ctx.rotate(NaN))
+      assert.doesNotThrow(() => ctx.rect(0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.arc(0,0,NaN,0,0))
+      assert.doesNotThrow(() => ctx.arc(0,0,NaN,0,0,false))
+      assert.doesNotThrow(() => lax.arc(0,0,NaN,0,0,new Date()))
+      assert.doesNotThrow(() => ctx.ellipse(0,0,0,NaN,0,0,0))
+      assert.doesNotThrow(() => ctx.moveTo(NaN,0))
+      assert.doesNotThrow(() => ctx.lineTo(NaN,0))
+      assert.doesNotThrow(() => ctx.arcTo(0,0,0,0,NaN))
+      assert.doesNotThrow(() => ctx.bezierCurveTo(0,0,0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.quadraticCurveTo(0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.conicCurveTo(0,0,NaN,0,1))
+      assert.doesNotThrow(() => ctx.roundRect(0,0,0,0,NaN))
+      assert.doesNotThrow(() => ctx.roundRect(NaN,0,0,0,5))
+      assert.doesNotThrow(() => ctx.roundRect(0,0,NaN,0,5))
+      assert.doesNotThrow(() => ctx.fillRect(0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.strokeRect(0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.clearRect(0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.fillText("text", 0, NaN))
+      assert.doesNotThrow(() => ctx.fillText("text", 0, 0, NaN))
+      assert.doesNotThrow(() => ctx.strokeText("text", 0, NaN))
+      assert.doesNotThrow(() => ctx.strokeText("text", 0, 0, NaN))
+      assert.doesNotThrow(() => ctx.setLineDash([NaN, 0, 0]))
+      assert.doesNotThrow(() => ctx.outlineText("text", NaN))
+      assert.doesNotThrow(() => ctx.drawImage(img,NaN,0))
+      assert.doesNotThrow(() => ctx.drawImage(img,0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.drawImage(img,0,0,0,0,NaN,0,0,0))
+      assert.doesNotThrow(() => ctx.drawCanvas(canvas,NaN,0))
+      assert.doesNotThrow(() => ctx.drawCanvas(canvas,0,0,NaN,0))
+      assert.doesNotThrow(() => ctx.drawCanvas(canvas,0,0,0,0,NaN,0,0,0))
+
+      // no error, returns false
+      assert.equal(ctx.isPointInPath(10, NaN, "evenodd"), false)
+      assert.equal(ctx.isPointInPath(p2d, 10, NaN, "evenodd"), false)
+      assert.equal(ctx.isPointInPath(p2d, 10), false)
+      assert.equal(ctx.isPointInStroke(10, NaN), false)
+      assert.equal(ctx.isPointInStroke(p2d, 10, NaN), false)
+      assert.equal(ctx.isPointInStroke(p2d, 10), false)
+    })
+
+  })
+
+})

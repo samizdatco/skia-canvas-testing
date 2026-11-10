@@ -1,0 +1,833 @@
+#![allow(clippy::neg_cmp_op_on_partial_ord)] // `!(x > 0.0)` deliberately rejects NaN too
+#![allow(non_snake_case)]
+use std::cell::{Ref, RefCell};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
+use std::fmt::Write;
+use neon::prelude::*;
+use skia_safe::{Path, Point, Vector, PathFillType, PathDirection, PathBuilder, PathVerb, Rect, RRect, Matrix, StrokeRec};
+use skia_safe::{PathEffect, trim_path_effect, ContourMeasure, ContourMeasureIter};
+use skia_safe::path::{self, AddPathMode, Verb};
+use svgtypes::{PathParser, PathSegment};
+
+use crate::bridge::*;
+use crate::drawlist::Pen;
+use crate::mem;
+
+pub type BoxedPath2D = JsBox<RefCell<Path2D>>;
+impl Finalize for Path2D {}
+
+pub struct Path2D{
+  builder: PathBuilder,
+  cache: RefCell<Option<Path>>, // lazy snapshot of the builder; invalidated on every append
+  measure: RefCell<Option<Measure>>, // lazy whole-path arc-length ruler; invalidated with the cache
+  footprint: RefCell<mem::v8::Footprint>, // retained geometry & measure size reported to V8
+}
+
+impl Default for Path2D {
+  fn default() -> Self {
+    Self{
+      builder:PathBuilder::new(), cache:RefCell::new(None), measure:RefCell::new(None),
+      footprint:RefCell::new(mem::v8::Footprint::default())
+    }
+  }
+}
+
+impl From<PathBuilder> for Path2D{
+  fn from(builder: PathBuilder) -> Self {
+    // leave the cache empty: the geometry is charged when `path()` first materializes it
+    Self{ builder, ..Self::default() }
+  }
+}
+
+impl From<Path> for Path2D{
+  fn from(path: Path) -> Self {
+    let footprint = mem::v8::Footprint::new(path.approximate_bytes_used());
+    Self{
+      builder:PathBuilder::new_path(&path), cache:RefCell::new(Some(path)),
+      footprint:RefCell::new(footprint), ..Self::default()
+    }
+  }
+}
+
+impl Path2D{
+  pub fn from_svg(svg:&str) -> Self {
+    use PathSegment::*;
+
+    // validate the path like the browser (reject if first command isn't a MoveTo, truncate at first bad command)
+    let mut segments = vec![];
+    let mut complete = true;
+    for segment in PathParser::from(svg){
+      match segment{
+        Ok(segment) => segments.push(segment),
+        Err(_) => { complete = false; break }
+      }
+    }
+
+    // if valid, use as-is
+    if complete && let Some(path) = Path::from_svg(svg){
+      return Self::from(path)
+    }
+
+    // if invalid, reconstruct up to the first error
+    let mut valid = String::new();
+    for segment in segments{
+      let args = match segment{
+        MoveTo{x, y, ..} | LineTo{x, y, ..} | SmoothQuadratic{x, y, ..} => vec![x, y],
+        HorizontalLineTo{x, ..} => vec![x],
+        VerticalLineTo{y, ..} => vec![y],
+        CurveTo{x1, y1, x2, y2, x, y, ..} => vec![x1, y1, x2, y2, x, y],
+        SmoothCurveTo{x2, y2, x, y, ..} => vec![x2, y2, x, y],
+        Quadratic{x1, y1, x, y, ..} => vec![x1, y1, x, y],
+        EllipticalArc{rx, ry, x_axis_rotation, large_arc, sweep, x, y, ..} =>
+          vec![rx, ry, x_axis_rotation, large_arc as u8 as f64, sweep as u8 as f64, x, y],
+        ClosePath{..} => vec![],
+      };
+      valid.push(segment.command() as char);
+      for arg in args{
+        let _ = write!(valid, " {arg}");
+      }
+    }
+    Self::from(Path::from_svg(&valid).unwrap_or_default())
+  }
+
+  // either return the cached path (if no additional appends have happened) or replay the builder to generate a new one
+  pub fn path(&self) -> Path {
+    let mut cache = self.cache.borrow_mut();
+    if cache.is_none() {
+      let snapshot = self.builder.snapshot();
+      self.footprint.borrow_mut().set(snapshot.approximate_bytes_used());
+      *cache = Some(snapshot);
+    }
+    cache.as_ref().unwrap().clone()
+  }
+
+  // generate a fresh path from the geometry with the transform baked into it
+  pub fn snapshot_transformed(&self, matrix: &Matrix) -> Path {
+    self.builder.snapshot_and_transform(Some(matrix))
+  }
+
+  // invalidate the cache and return the builder (to allow for a new append)
+  pub fn update(&mut self) -> &mut PathBuilder {
+    self.cache.borrow_mut().take();
+    if let Some(measure) = self.measure.borrow_mut().take(){
+      self.footprint.borrow_mut().grow(-(measure.bytes as i64));
+    }
+    &mut self.builder
+  }
+
+  // borrow the arc-length ruler (and lazily build it if necessary)
+  pub fn measure(&self) -> Ref<'_, Measure> {
+    if self.measure.borrow().is_none(){
+      let ruler = Measure::new(&self.path());
+      self.footprint.borrow_mut().grow(ruler.bytes as i64);
+      *self.measure.borrow_mut() = Some(ruler);
+    }
+    Ref::map(self.measure.borrow(), |measure| measure.as_ref().unwrap())
+  }
+
+  pub fn scoot(&mut self, x: f32, y: f32){
+    if self.builder.is_empty(){
+      self.update().move_to((x, y));
+    }
+  }
+
+  // the current point (end of the last-added verb), or None if the path is empty
+  pub fn last_point(&self) -> Option<Point> {
+    let (verbs, mut points) = (self.builder.verbs(), self.builder.points());
+    match verbs.last()?{
+      PathVerb::Close => {
+        // walk backward to find the Move at the start of the subpath that's being closed
+        for verb in verbs.iter().rev(){
+          let skip = match verb{
+            PathVerb::Move => return points.last().copied(),
+            PathVerb::Line => 1,
+            PathVerb::Quad | PathVerb::Conic => 2,
+            PathVerb::Cubic => 3,
+            PathVerb::Close => 0,
+          };
+          points = &points[..points.len().saturating_sub(skip)];
+        }
+        None
+      },
+
+      // otherwise just use the point from the last verb
+      _ => points.last().copied()
+    }
+  }
+
+  pub fn append_path(&mut self, src:&Path, matrix:&Matrix){
+    self.update().add_path_with_transform(src, matrix, AddPathMode::Append);
+  }
+
+  pub fn extend_path(&mut self, sub:&Path, matrix:&Matrix){
+    self.update().add_path_with_transform(sub, matrix, AddPathMode::Extend);
+  }
+
+  pub fn conic_to_normalized(&mut self, p1:impl Into<Point>, p2:impl Into<Point>, weight:f32){
+    let (p1, p2) = (p1.into(), p2.into());
+    let builder = self.update();
+
+    // PathBuilder::conic_to doesn't normalize weights, so do some special casing for nonsense values
+    if !(weight > 0.0){
+      builder.line_to(p2);
+    }else if !weight.is_finite(){
+      builder.line_to(p1);
+      builder.line_to(p2);
+    }else if weight == 1.0{
+      builder.quad_to(p1, p2);
+    }else{
+      builder.conic_to(p1, p2, weight);
+    }
+  }
+
+  pub fn add_ellipse(&mut self, origin:impl Into<Point>, radii:impl Into<Point>, rotation: f64, start_angle:f64, end_angle:f64, ccw:bool){
+    let Point{x, y} = origin.into();
+    let Point{x:x_radius, y:y_radius} = radii.into();
+
+    let tau = 2.0 * std::f64::consts::PI;
+    let mut new_start_angle = start_angle % tau;
+    if new_start_angle < 0.0 {
+      new_start_angle += tau;
+    }
+    let delta = new_start_angle - start_angle;
+    let start_angle = new_start_angle;
+    let mut end_angle = end_angle + delta;
+
+    if !ccw && start_angle > end_angle {
+      end_angle = start_angle + (tau - (start_angle - end_angle) % tau);
+    }else if ccw && start_angle < end_angle {
+      end_angle = start_angle - (tau - (end_angle - start_angle) % tau);
+    }
+
+    let oval = Rect::new(x - x_radius, y - y_radius, x + x_radius, y + y_radius);
+
+    let mut rotated = Matrix::new_identity();
+    rotated
+      .pre_translate((x, y))
+      .pre_rotate(rotation.to_degrees() as f32, None)
+      .pre_translate((-x, -y));
+
+    // build the arc independently then *extend* the path (drawing a connecting line from the prior point)
+    let mut arc = PathBuilder::new();
+    let sweep = (end_angle - start_angle).to_degrees() as f32;
+    let start = (start_angle.to_degrees() % 360.0) as f32;
+
+    if sweep.abs() >= 360.0 {
+      // draw 360° ellipses in two 180° segments; trying to draw the full ellipse at once draws nothing
+      let half = 180.0_f32.copysign(sweep);
+      arc.arc_to(oval, start, half, false);
+      arc.arc_to(oval, (start + half) % 360.0, half, false);
+    }else{
+      // Draw <360° ellipses in a single arc
+      arc.arc_to(oval, start, sweep, false);
+    }
+
+    self.extend_path(&arc.detach(), &rotated);
+  }
+}
+
+// receives verbs from the shared DrawList decoder and applies them verbatim (i.e., no baked-in CTM)
+impl Pen for Path2D {
+  fn move_to(&mut self, x:f32, y:f32){ self.update().move_to((x, y)); }
+  fn line_to(&mut self, x:f32, y:f32){ self.scoot(x, y); self.update().line_to((x, y)); }
+  fn bezier_to(&mut self, c1x:f32, c1y:f32, c2x:f32, c2y:f32, x:f32, y:f32){
+    self.scoot(c1x, c1y);
+    self.update().cubic_to((c1x, c1y), (c2x, c2y), (x, y));
+  }
+  fn quad_to(&mut self, cx:f32, cy:f32, x:f32, y:f32){
+    self.scoot(cx, cy);
+    self.update().quad_to((cx, cy), (x, y));
+  }
+  fn conic_to(&mut self, cx:f32, cy:f32, x:f32, y:f32, w:f32){
+    self.scoot(cx, cy);
+    self.conic_to_normalized((cx, cy), (x, y), w);
+  }
+  fn arc(&mut self, x:f32, y:f32, r:f32, start:f64, end:f64, ccw:bool){
+    self.add_ellipse((x, y), (r, r), 0.0, start, end, ccw);
+  }
+  fn arc_to(&mut self, x1:f32, y1:f32, x2:f32, y2:f32, r:f32){
+    self.scoot(x1, y1);
+    self.update().arc_to_tangent((x1, y1), (x2, y2), r);
+  }
+  fn ellipse(&mut self, x:f32, y:f32, xr:f32, yr:f32, rot:f64, start:f64, end:f64, ccw:bool){
+    self.add_ellipse((x, y), (xr, yr), rot, start, end, ccw);
+  }
+  fn rect(&mut self, x:f32, y:f32, w:f32, h:f32){
+    // enulate browser's corner orderL moveTo(x,y), then CW/CCW based on the sign of w×h
+    self.update()
+      .move_to((x, y))
+      .line_to((x+w, y))
+      .line_to((x+w, y+h))
+      .line_to((x, y+h))
+      .close();
+  }
+  fn round_rect(&mut self, x:f32, y:f32, w:f32, h:f32, radii:[Point;4]){
+    let rect = Rect::from_xywh(x, y, w, h);
+    let rrect = RRect::new_rect_radii(rect, &radii);
+    let direction = if w.signum() == h.signum(){ PathDirection::CW }else{ PathDirection::CCW };
+    self.update()
+      .add_rrect(rrect, direction, 0)
+      .move_to((x, y)); // the next segment starts from the corner, not on the outline
+  }
+  fn close(&mut self){ self.update().close(); }
+}
+
+// measure all the path's contours laid end-to-end (so a distance can locate any point on the path)
+pub struct Measure{
+  contours: Vec<ContourMeasure>,
+  offsets: Vec<f64>, // cumulative start distance of each contour
+  total: f64, // total length of the whole path (f64, so accumulation doesn't drift on huge paths)
+  bytes: usize, // estimated size of the segment tables
+}
+
+impl Measure{
+  fn new(path:&Path) -> Self {
+    let mut contours = vec![];
+    let mut offsets = vec![];
+    let mut total = 0.0;
+    // force_closed:false — don't invent a closing segment for open contours
+    // (zero-length contours are skipped by the iterator entirely)
+    for contour in ContourMeasureIter::new(path, false, None){
+      offsets.push(total);
+      total += contour.length() as f64;
+      contours.push(contour);
+    }
+    Self{contours, offsets, total, bytes:measure_size_estimate(path)}
+  }
+
+  // canonicalize a user distance: negatives count back from the end, clamp to [0, total]
+  fn normalize(&self, d:f64) -> Option<f64> {
+    if d.is_nan(){ return None }
+    let d = if d < 0.0 { d + self.total } else { d };
+    Some(d.clamp(0.0, self.total))
+  }
+
+  // map a whole-path distance to a position + tangent
+  fn locate(&self, d:f64) -> Option<(Point, Vector)> {
+    let d = self.normalize(d)?;
+    let idx = self.offsets.partition_point(|&start| start <= d).saturating_sub(1);
+    let contour = self.contours.get(idx)?;
+    contour.pos_tan((d - self.offsets[idx]) as f32)
+  }
+
+  // the tangent at a given distance (tangent is f32s but converted to f64 for the atan2)
+  fn heading(&self, d:f64) -> Option<f64> {
+    self.locate(d).map(|(_, tangent)| (tangent.y as f64).atan2(tangent.x as f64))
+  }
+}
+
+// estimate the size of the measure table based on Skia's curve-subdivision behavior
+fn measure_size_estimate(path:&Path) -> usize {
+  const TOL:f32 = 0.5; // CHEAP_DIST_LIMIT / res_scale
+  let dev = |p:Point, q:Point| (p.x - q.x).abs().max((p.y - q.y).abs());
+  let lerp = |p:Point, q:Point, t:f32| Point::new(p.x + (q.x - p.x) * t, p.y + (q.y - p.y) * t);
+  let curve_segs = |deviation:f32| {
+    let levels = (deviation / TOL).max(1.0).log2() / 2.0; // log₄ of the deviation ratio
+    1usize << (levels.ceil().min(8.0) as u32) // kMaxRecursionDepth = 8 → ≤256 segments
+  };
+
+  let (mut segments, mut points) = (0usize, 0usize);
+  for (verb, pts) in path::Iter::new(path, false){
+    let (segs, n_pts) = match verb{
+      Verb::Move => (0, 1),
+      Verb::Line | Verb::Close => (1, 1), // close emits a line back to the contour's start
+      Verb::Quad => (curve_segs(0.5 * dev(pts[1], lerp(pts[0], pts[2], 0.5))), 2),
+      Verb::Conic => (curve_segs(0.5 * dev(pts[1], lerp(pts[0], pts[2], 0.5))), 3), // the weight rides in an extra point
+      Verb::Cubic => (curve_segs(
+        dev(pts[1], lerp(pts[0], pts[3], 1.0/3.0)).max(dev(pts[2], lerp(pts[0], pts[3], 2.0/3.0)))
+      ), 3),
+      _ => (0, 0),
+    };
+    segments += segs;
+    points += n_pts;
+  }
+  12 * segments + 8 * points // sizeof(Segment) and sizeof(SkPoint)
+}
+
+
+//
+// -- Javascript Methods --------------------------------------------------------------------------
+//
+
+pub fn new(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  Ok(cx.boxed(RefCell::new(Path2D::default())))
+}
+
+pub fn from_path(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let other_path = path2d_arg(&mut cx, 1)?;
+  let path = other_path.borrow().path();
+  Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+}
+
+pub fn from_svg(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let svg_string = string_arg(&mut cx, 1, "svgPath")?;
+  Ok(cx.boxed(RefCell::new(Path2D::from_svg(&svg_string))))
+}
+
+// Adds a path to the current path.
+pub fn addPath(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let other = path2d_arg(&mut cx, 1)?;
+  let matrix = opt_matrix_arg(&mut cx, 2).unwrap_or_else(
+    Matrix::new_identity
+  );
+
+  // the snapshot is already a copy, so this is safe even when adding a path to itself
+  let src = other.borrow().path();
+  this.borrow_mut().append_path(&src, &matrix);
+
+  Ok(cx.undefined())
+}
+
+// convert skia's path-op results (which all expect to be drawn with `even-odd` winding) so they'll
+// work correctly in the `nonzero` world of canvas's Path2D
+fn rule_independent(path:Path) -> Path {
+  let mut path = path;
+  path.set_fill_type(PathFillType::EvenOdd);
+  let mut path = match path.as_winding(){ Some(rewound) => rewound, None => path };
+  path.set_fill_type(PathFillType::EvenOdd);
+  match path.simplify(){ Some(simpler) => simpler, None => path }
+}
+
+// Applies a boolean operator to this and a second path, returning a new Path2D with their combination
+pub fn op(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let other_path = path2d_arg(&mut cx, 1)?;
+  let op_name = string_arg(&mut cx, 2, "pathOp")?;
+
+  if let Some(path_op) = to_path_op(&op_name){
+    let this = this.borrow();
+    let other = other_path.borrow();
+    match this.path().op(&other.path(), path_op) {
+      Some(path) => Ok(cx.boxed(RefCell::new(Path2D::from(rule_independent(path))))),
+      None => cx.throw_error("path operation failed")
+    }
+  }else{
+    cx.throw_error("pathOp must be Difference, Intersect, Union, XOR, or Complement")
+  }
+}
+
+pub fn interpolate(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let other = path2d_arg(&mut cx, 1)?;
+  let weight = float_arg(&mut cx, 2, "weight")?;
+
+  let this = this.borrow();
+  let other = other.borrow();
+  // reverse path order since 0..1 = this..other is a less non-sensical mapping than the default
+  if let Some(path) = other.path().interpolate(&this.path(), weight){
+    Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+  }else{
+    cx.throw_type_error("Can only interpolate between two Path2D objects with the same number of points and control points")
+  }
+}
+
+// Returns a path with only non-overlapping contours that describe the same area as the original path
+pub fn simplify(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let rule = fill_rule_arg_or(&mut cx, 1, "nonzero")?;
+  let this = this.borrow();
+
+  let mut path = this.path();
+  path.set_fill_type(rule);
+
+  let new_path = Path2D::from(rule_independent(match this.path().set_fill_type(rule).simplify(){
+    Some(simpler) => simpler,
+    None => path
+  }));
+
+  Ok(cx.boxed(RefCell::new(new_path)))
+}
+
+// Returns a path that can be drawn with a nonzero fill but looks like the original drawn with evenodd
+pub fn unwind(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let mut this = this.borrow_mut();
+
+  this.update().set_fill_type(PathFillType::EvenOdd);
+
+  let path = this.path();
+  let new_path = Path2D::from(match path.as_winding(){
+    Some(rewound) => rewound,
+    None => path
+  });
+
+  Ok(cx.boxed(RefCell::new(new_path)))
+}
+
+// Returns a copy whose points have been shifted by (dx, dy)
+pub fn offset(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let dx = float_arg(&mut cx, 1, "dx")?;
+  let dy = float_arg(&mut cx, 2, "dy")?;
+
+  let this = this.borrow();
+  let path = this.snapshot_transformed(&Matrix::translate((dx, dy)));
+  Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+}
+
+// Returns a copy whose points have been transformed by a given matrix
+pub fn transform(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let matrix = matrix_arg(&mut cx, 1)?;
+
+  let this = this.borrow();
+  let path = this.snapshot_transformed(&matrix);
+  Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+}
+
+// Returns a copy where every sharp junction to an arcTo-style rounded corner
+pub fn round(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let radius = float_arg(&mut cx, 1, "radius")?;
+
+  let this = this.borrow();
+  let path = this.path();
+  let bounds = *path.bounds();
+  let stroke_rec = StrokeRec::new_hairline();
+
+  if let Some(rounder) = PathEffect::corner_path(radius)
+    && let Some((rounded, _)) = rounder.filter_path(&path, &stroke_rec, bounds)
+  {
+    return Ok(cx.boxed(RefCell::new(Path2D::from(rounded))))
+  }
+
+  Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+}
+
+// Clips a proportional segment out of the middle of the path (or the edges if invert=true)
+pub fn trim(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let start = float_arg_or_bail(&mut cx, 1, "start")?;
+  let end = float_arg_or_bail(&mut cx, 2, "end")?;
+  let invert = bool_arg_or(&mut cx, 3, false);
+
+  let this = this.borrow();
+  let path = this.path();
+  let bounds = *path.bounds();
+  let stroke_rec = StrokeRec::new_hairline();
+  let mode = if invert{ trim_path_effect::Mode::Inverted }else{ trim_path_effect::Mode::Normal };
+
+  if let Some(trimmer) = PathEffect::trim(start, end, mode)
+    && let Some((trimmed, _)) = trimmer.filter_path(&path, &stroke_rec, bounds)
+  {
+    return Ok(cx.boxed(RefCell::new(Path2D::from(trimmed))))
+  }
+
+  Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+}
+
+// Discretizes the path at a fixed segment length then randomly offsets the points
+pub fn jitter(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let seg_len = float_arg_or_bail(&mut cx, 1, "segmentLength")?;
+  let std_dev = float_arg_or_bail(&mut cx, 2, "variance")?;
+  let seed = float_arg_or(&mut cx, 3, 0.0) as u32;
+
+  let this = this.borrow();
+  let path = this.path();
+  let bounds = *path.bounds();
+  let stroke_rec = StrokeRec::new_hairline();
+
+  if let Some(trimmer) = PathEffect::discrete(seg_len, std_dev, Some(seed))
+    && let Some((jittered, _)) = trimmer.filter_path(&path, &stroke_rec, bounds)
+  {
+    return Ok(cx.boxed(RefCell::new(Path2D::from(jittered))))
+  }
+
+  Ok(cx.boxed(RefCell::new(Path2D::from(path))))
+}
+
+// Returns the computed `tight` bounds that contain all the points, control points, and connecting contours
+pub fn bounds(mut cx: FunctionContext) -> JsResult<JsObject> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let this = this.borrow();
+
+  let b = this.path().compute_tight_bounds();
+
+  let js_object: Handle<JsObject> = cx.empty_object();
+  let left = cx.number(b.left);
+  let top = cx.number(b.top);
+  let right = cx.number(b.right);
+  let bottom = cx.number(b.bottom);
+  let width = cx.number(b.width());
+  let height = cx.number(b.height());
+
+  js_object.set(&mut cx, "left", left)?;
+  js_object.set(&mut cx, "top", top)?;
+  js_object.set(&mut cx, "right", right)?;
+  js_object.set(&mut cx, "bottom", bottom)?;
+  js_object.set(&mut cx, "width", width)?;
+  js_object.set(&mut cx, "height", height)?;
+  Ok(js_object)
+}
+
+pub fn contains(mut cx: FunctionContext) -> JsResult<JsBoolean> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let x = float_arg(&mut cx, 1, "x")?;
+  let y = float_arg(&mut cx, 2, "y")?;
+  let this = this.borrow();
+
+  Ok(cx.boolean(this.path().contains((x,y))))
+}
+
+// total arc length of all the path's contours
+pub fn get_length(mut cx: FunctionContext) -> JsResult<JsNumber> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let this = this.borrow();
+
+  Ok(cx.number(this.measure().total))
+}
+
+// the point a given distance along the path (or null if the path has no length)
+pub fn position_at(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let distance = distance_arg(&mut cx, 1);
+  let this = this.borrow();
+
+  match this.measure().locate(distance){
+    Some((Point{x, y}, _)) => {
+      let js_object = cx.empty_object();
+      let x = cx.number(x);
+      let y = cx.number(y);
+      js_object.set(&mut cx, "x", x)?;
+      js_object.set(&mut cx, "y", y)?;
+      Ok(js_object.upcast())
+    }
+    None => Ok(cx.null().upcast())
+  }
+}
+
+// tangent direction (in radians) at given distance along the path (or null if the path has no length)
+pub fn tangent_at(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let distance = distance_arg(&mut cx, 1);
+  let this = this.borrow();
+
+  match this.measure().heading(distance){
+    Some(heading) => Ok(cx.number(heading).upcast()),
+    None => Ok(cx.null().upcast())
+  }
+}
+
+// convenience method returning tangent-π/2, normalized to lie in the (-π, π] range
+pub fn normal_at(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let distance = distance_arg(&mut cx, 1);
+  let this = this.borrow();
+
+  match this.measure().heading(distance){
+    Some(heading) => {
+      let normal = heading - FRAC_PI_2;
+      let normal = if normal <= -PI { normal + TAU } else { normal };
+      Ok(cx.number(normal).upcast())
+    }
+    None => Ok(cx.null().upcast())
+  }
+}
+
+// create a new Path2D spanning between two locations along the path (or its complement)
+pub fn slice(mut cx: FunctionContext) -> JsResult<BoxedPath2D> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let start = opt_distance_arg(&mut cx, 1);
+  let end = opt_distance_arg(&mut cx, 2);
+  let inverted = bool_arg_or(&mut cx, 3, false);
+  let this = this.borrow();
+  let measure = this.measure();
+
+  // use Array.slice conventions: omitted args span the whole path, NaN coerces to
+  // zero, negatives count back from the end, and everything clamps to [0, length]
+  let start = measure.normalize(start.unwrap_or(0.0)).unwrap_or(0.0);
+  let end = measure.normalize(end.unwrap_or(measure.total)).unwrap_or(0.0);
+
+  // the requested stretch(es): empty if start>=end, flipped if inverted==true
+  let ranges:Vec<(f64, f64)> = match (inverted, start <= end){
+    (false, true) => vec![(start, end)],
+    (false, false) => vec![],
+    (true, true) => vec![(0.0, start), (end, measure.total)],
+    (true, false) => vec![(0.0, measure.total)],
+  };
+
+  // emit each contour in the range (preserving the moveTo gaps between them)
+  let mut builder = PathBuilder::new();
+  for (contour, &offset) in measure.contours.iter().zip(measure.offsets.iter()){
+    for &(from, to) in ranges.iter(){
+      let lo = (from.max(offset) - offset) as f32;
+      let hi = (to.min(offset + contour.length() as f64) - offset) as f32;
+      if hi > lo{
+        let _ = contour.get_segment(lo, hi, &mut builder, true);
+      }
+    }
+  }
+
+  Ok(cx.boxed(RefCell::new(Path2D::from(builder.detach()))))
+}
+
+// return a sequence of x/y points along the path, either adjusted to fit the contour "even"-ly and
+// include both endpoints, or at "exact" multiples of `step`
+pub fn points(mut cx: FunctionContext) -> JsResult<JsArray> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let step = distance_arg(&mut cx, 1); // kept as f64 so the endpoint check below has sufficient precision
+  let even = match opt_string_arg(&mut cx, 2).as_deref(){
+    Some("even") | None => true,
+    Some("exact") => false,
+    Some(mode) => cx.throw_type_error(format!("⚠️Expected `mode` to be \"even\" or \"exact\" (got {:?})", mode))?
+  };
+  let this = this.borrow();
+
+  if !(step > 0.0){ // also catches NaN
+    cx.throw_type_error("⚠️Expected `step` to be a positive number")?
+  }
+
+  let samples = this.measure()
+    .contours.iter().flat_map(|contour| {
+      // restart the step-counter at each new contour (always including the initial point)
+      let len = contour.length() as f64;
+
+      let mut pts:Vec<Point> = if even{
+        // always include the final point in "even" mode and adjust in-between spacing
+        let n = (len / step).round().max(1.0);
+        let fitted = len / n;
+        (0..=n as usize).filter_map(|i| contour.pos_tan((i as f64 * fitted) as f32).map(|(pt, _)| pt)).collect()
+      }else{
+        // only include the final point in "exact" mode when it falls within the rounding tolerance
+        let tolerance = len * 1e-12;
+        (0..).map(|i| i as f64 * step)
+          .take_while(|d| *d <= len + tolerance)
+          .filter_map(|d| contour.pos_tan(d as f32).map(|(pt, _)| pt))
+          .collect()
+      };
+
+      // on a closed contour, don't emit the start/stop point twice
+      if pts.len() > 1{
+        let (first, last) = (pts[0], pts[pts.len() - 1]);
+        if almost_zero(first.x - last.x) && almost_zero(first.y - last.y){
+          pts.pop();
+        }
+      }
+      pts
+    }).collect::<Vec<Point>>();
+
+  let array = cx.empty_array();
+  for (i, Point{x, y}) in samples.into_iter().enumerate(){
+    let pair = cx.empty_array();
+    let x = cx.number(x);
+    let y = cx.number(y);
+    pair.set(&mut cx, 0, x)?;
+    pair.set(&mut cx, 1, y)?;
+    array.set(&mut cx, i as u32, pair)?;
+  }
+  Ok(array)
+}
+
+fn from_verb(verb:Verb) -> Option<String>{
+  let cmd = match verb{
+    Verb::Move => "moveTo",
+    Verb::Line => "lineTo",
+    Verb::Quad => "quadraticCurveTo",
+    Verb::Cubic => "bezierCurveTo",
+    Verb::Conic => "conicCurveTo",
+    Verb::Close => "closePath",
+    _ => return None
+  };
+  Some(cmd.to_string())
+}
+
+pub fn edges(mut cx: FunctionContext) -> JsResult<JsArray> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let this = this.borrow();
+
+  let path = this.path();
+  let mut weights = path::Iter::new(&path, false);
+  let iter = path::Iter::new(&path, false);
+
+  let mut edges = vec![];
+  for (verb, points) in iter{
+    weights.next();
+
+    if let Some(edge) = from_verb(verb){
+      let cmd = cx.string(edge);
+      let segment = cx.empty_array();
+      segment.set(&mut cx, 0, cmd)?;
+
+      let at_point = if points.len()>1{ 1 }else{ 0 };
+      for (i, pt) in points.iter().skip(at_point).enumerate() {
+        let x = cx.number(pt.x);
+        let y = cx.number(pt.y);
+        segment.set(&mut cx, 1 + 2*i as u32, x)?;
+        segment.set(&mut cx, 2 + 2*i as u32, y)?;
+      }
+
+      if verb==Verb::Conic{
+        let weight = weights.conic_weight().unwrap();
+        let weight = cx.number(weight);
+        segment.set(&mut cx, 5, weight)?;
+      }
+
+      edges.push(segment);
+    }
+  }
+
+  let verbs = cx.empty_array();
+  for (i, segment) in edges.iter().enumerate(){
+    verbs.set(&mut cx, i as u32, *segment)?;
+  }
+
+  Ok(verbs)
+}
+
+// an array of Path2Ds, one per contour from this path
+pub fn contours(mut cx: FunctionContext) -> JsResult<JsArray> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let this = this.borrow();
+  let path = this.path();
+
+  let mut paths:Vec<Path2D> = vec![];
+  let mut builder:Option<PathBuilder> = None;
+  let mut weights = path::Iter::new(&path, false);
+
+  // replay the verbs, starting a new builder at each moveTo
+  for (verb, pts) in path::Iter::new(&path, false){
+    weights.next();
+
+    if verb == Verb::Move{
+      if let Some(mut done) = builder.take(){
+        paths.push(Path2D::from(done.detach()));
+      }
+      builder.get_or_insert_default().move_to(pts[0]);
+    }else{
+      let builder = builder.get_or_insert_default();
+      match verb{
+        Verb::Line => { builder.line_to(pts[1]); },
+        Verb::Quad => { builder.quad_to(pts[1], pts[2]); },
+        Verb::Conic => { builder.conic_to(pts[1], pts[2], weights.conic_weight().unwrap()); },
+        Verb::Cubic => { builder.cubic_to(pts[1], pts[2], pts[3]); },
+        Verb::Close => { builder.close(); },
+        _ => {}
+      }
+    }
+  }
+  if let Some(mut done) = builder.take(){
+    paths.push(Path2D::from(done.detach()));
+  }
+
+  let array = cx.empty_array();
+  for (i, path) in paths.into_iter().enumerate(){
+    let boxed = cx.boxed(RefCell::new(path));
+    array.set(&mut cx, i as u32, boxed)?;
+  }
+  Ok(array)
+}
+
+pub fn get_d(mut cx: FunctionContext) -> JsResult<JsString> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let this = this.borrow();
+  Ok(cx.string(this.path().to_svg()))
+}
+
+pub fn set_d(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+  let this = cx.argument::<BoxedPath2D>(0)?;
+  let svg_string = string_arg(&mut cx, 1, "svgPath")?;
+  *this.borrow_mut() = Path2D::from_svg(&svg_string);
+  Ok(cx.undefined())
+}

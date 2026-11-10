@@ -1,0 +1,1492 @@
+// @ts-check
+
+"use strict"
+
+const path = require('path'),
+      os = require('os'),
+      fs = require('fs'),
+      {assert} = require('../runner/assert'),
+      {describe, test, beforeEach, afterEach} = require('node:test'),
+      {execFileSync} = require('node:child_process'),
+      {Canvas, FontLibrary} = require('../../lib')
+
+
+// ---------------------------------------------------------------------------
+// PDF export: verifies that exported PDFs carry selectable/searchable text —
+// the text path attaches each glyph run's source UTF-8 + cluster mapping to its blob.
+// ---------------------------------------------------------------------------
+
+// These tests verify the *exported* PDF against a real reader (pdftotext / poppler).
+// Where it isn't installed (e.g. CI runners), the whole group skips rather than fails.
+const hasPdftotext = (() => {
+  try { execFileSync('pdftotext', ['-v'], {stdio:'ignore'}); return true }
+  catch { return false }
+})()
+
+describe("Typography", () => {
+  /** @type {Canvas} */
+  let canvas
+  /** @type {import('../../lib').CanvasRenderingContext2D} */
+  let ctx
+  let WIDTH = 512, HEIGHT = 512,
+      FONTS_DIR = 'tests/assets/fonts',
+      findFont = font => path.join(FONTS_DIR, font);
+
+  beforeEach(() => {
+    canvas = new Canvas(WIDTH, HEIGHT)
+    ctx = canvas.getContext("2d")
+  })
+
+  afterEach(() => {
+    FontLibrary.reset()
+  })
+
+  test("fontSynthesis", () => {
+    // Monoton has a single (regular) face, so bold/italic have no *real* face to match
+    FontLibrary.use(findFont("Monoton-Regular.woff"))
+    let render = (spec, synth) => {
+      ctx.fontSynthesis = synth
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.font = `${spec} 80px Monoton`
+      ctx.fillText("RR", 40, 100)
+      return ctx.getImageData(0, 0, WIDTH, HEIGHT).data
+    }
+
+    // count opaque pixels for weight comparisons
+    let opaque = data => data.filter((v, i) => i % 4 == 3 && v > 10).length
+    // diff alpha channels of pixmaps for oblique/normal comparisons
+    let differs = (a, b) => { for (let i = 3; i < a.length; i += 4) if ((a[i] > 10) !== (b[i] > 10)) return true; return false }
+
+    assert.equal(ctx.fontSynthesis, true) // browser-parity default: synthesis on
+    let regular = render("400", true)
+    assert(opaque(regular) > 0)
+
+    // default is synthesis-on
+    assert(opaque(render("700", true)) > opaque(regular)) // faux bold lays down more ink
+    assert(differs(render("italic", true), regular))      // faux oblique skews the glyphs
+
+    // ensure that disabling it actually prevents fake weight/slant
+    assert.equal(opaque(render("700", false)), opaque(regular))
+    assert(!differs(render("italic", false), regular))
+
+    // check that the setting isn't cached across calls (i.e., FontLibrary clears its cache)
+    assert(opaque(render("700", true)) > opaque(regular))
+  })
+
+  test("fontHinting", () => {
+    // a face whose hinting instructions survive in the tracked woff2 subset
+    FontLibrary.use("Montserrat", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+
+    let render = (hinting) => {
+      ctx.fontHinting = hinting
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.font = '11px Montserrat'
+      ctx.fillText("Illegible waveforms 10x", 10, 24)
+      return ctx.getImageData(0, 0, WIDTH, HEIGHT).data
+    }
+    let differs = (a, b) => { for (let i = 3; i < a.length; i += 4) if (a[i] !== b[i]) return true; return false }
+
+    // boolean property; hinting disabled by default to match browser rendering
+    assert.equal(ctx.fontHinting, false)
+    ctx.fontHinting = true
+    assert.equal(ctx.fontHinting, true)
+
+    // truthy coercion like fontSynthesis (invalid values never throw)
+    // @ts-expect-error — deliberately mistyped: exercises truthy coercion
+    ctx.fontHinting = 0
+    assert.equal(ctx.fontHinting, false)
+    // @ts-expect-error — deliberately mistyped: exercises truthy coercion
+    ctx.fontHinting = 'yes'
+    assert.equal(ctx.fontHinting, true)
+
+    // hinted vs unhinted rasterization must differ at text sizes (DirectWrite quantization is
+    // unverified, hence the win32 escape hatch) — except on macOS, where CoreText never grid-fits and
+    // the property is a no-op (its old side effect, CoreGraphics font smoothing, is now
+    // `textRendering: "optimizeLegibility"`)
+    let unhinted = render(false)
+    let hinted = render(true)
+    if (os.platform() == 'darwin'){
+      assert(!differs(hinted, unhinted))
+    }else if (os.platform() != 'win32'){
+      assert(differs(hinted, unhinted))
+    }
+
+    // toggling back must return to the identical rendering (i.e., FontLibrary clears its cache)
+    assert(!differs(render(false), unhinted))
+  })
+
+  test("fontSmoothing", () => {
+    FontLibrary.use("Montserrat", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+
+    let census = (smoothing) => {
+      ctx.fontSmoothing = smoothing
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.font = '40px Montserrat'
+      ctx.fillText("Osprey wings", 10, 55)
+      let data = ctx.getImageData(0, 0, WIDTH, HEIGHT).data,
+          tally = {opaque:0, partial:0}
+      for (let i = 3; i < data.length; i += 4){
+        if (data[i] == 255) tally.opaque++
+        else if (data[i] > 0) tally.partial++
+      }
+      return tally
+    }
+
+    // boolean property; smoothing on by default (truthy coercion, like fontSynthesis)
+    assert.equal(ctx.fontSmoothing, true)
+    ctx.fontSmoothing = false
+    assert.equal(ctx.fontSmoothing, false)
+    // @ts-expect-error — deliberately mistyped: exercises truthy coercion
+    ctx.fontSmoothing = 'yes'
+    assert.equal(ctx.fontSmoothing, true)
+
+    // smoothed edges include partial-alpha pixels; aliased coverage is strictly 0/255
+    let aliased = census(false)
+    assert(aliased.opaque > 0)
+    assert.equal(aliased.partial, 0)
+    let antialiased = census(true)
+    assert(antialiased.partial > 0)
+
+    // toggling back must re-alias (i.e., FontLibrary clears its cache)
+    assert.equal(census(false).partial, 0)
+
+    // smoothing also drives subpixel positioning: fractional placement renders
+    // differently than the aliased/grid-snapped case, and round-trips after toggling
+    let render = (smoothing) => {
+      ctx.fontSmoothing = smoothing
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.font = '11px Montserrat'
+      ctx.fillText("Illegible waveforms 10x", 10.5, 24)
+      return ctx.getImageData(0, 0, WIDTH, HEIGHT).data
+    }
+    let differs = (a, b) => { for (let i = 3; i < a.length; i += 4) if (a[i] !== b[i]) return true; return false }
+    let smoothed = render(true)
+    assert(differs(render(false), smoothed))
+    assert(!differs(render(true), smoothed))
+  })
+
+  test("fontKerning", () => {
+    let width = str => ctx.measureText(str).width
+
+    // defaults to auto & round-trips (auto/normal/none only)
+    assert.equal(ctx.fontKerning, "auto") // the CSS/canvas default
+    ctx.fontKerning = "normal"; assert.equal(ctx.fontKerning, "normal")
+    ctx.fontKerning = "none";   assert.equal(ctx.fontKerning, "none")
+    ctx.fontKerning = "auto";   assert.equal(ctx.fontKerning, "auto")
+    // @ts-expect-error — deliberately invalid; only auto/normal/none are valid, others are silently ignored
+    ctx.fontKerning = "loose"
+    assert.equal(ctx.fontKerning, "auto")
+
+    // `none` disables kerning: Montserrat kerns AV/VA/To tightly, so turning it off widens the run
+    FontLibrary.use("Montserrat", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+    ctx.font = "100px Montserrat"
+    let text = "AVAWAToTa"
+    ctx.fontKerning = "auto"
+    let on = width(text)
+    ctx.fontKerning = "none"
+    assert(width(text) > on)
+    ctx.fontKerning = "normal" // auto & normal both leave kerning on
+    assert.nearEqual(width(text), on)
+
+    // composes with fontVariant (the kern toggle must not clobber its features): tabular-nums keeps
+    // digit advances equal even with kerning disabled
+    ctx.fontKerning = "none"
+    ctx.fontVariant = "tabular-nums"
+    assert.nearEqual(width("1"), width("8"))
+    ctx.fontVariant = "normal"
+
+    // font-kerning isn't part of the CSS `font` grammar, so (like letterSpacing) it survives the shorthand
+    ctx.fontKerning = "none"
+    ctx.font = "40px serif"
+    assert.equal(ctx.fontKerning, "none")
+  })
+
+  test("textBaseline", async () => {
+    FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+    // the line's y-origin used to be rounded in user space (as skparagraph's painter does), which left
+    // the glyphs a fraction of a pixel off the anchor and a whole device pixel off at higher densities
+    const SIZE = 60, X = 8, text = "H"
+    for (const px of [13, 18, 24])
+      for (const y of [30, 30.25, 30.75])
+        for (const density of [1, 2, 3]){
+          const canvas = new Canvas(SIZE, SIZE), ctx = canvas.getContext("2d")
+          Object.assign(ctx, {font: `${px}px TestFace`, fontSmoothing: false})
+          ctx.fillText(text, X, y)
+          assert.nearEqual(ctx.measureText(text).lines[0].alphabeticBaseline, 0, 1e-3)
+
+          // aliased 'H' sits flat on the baseline, so its last painted device row is the row above it
+          const data = await canvas.toBuffer("raw", {density}), w = SIZE * density
+          let bottom = null
+          for (let row = 0; row < SIZE * density; row++)
+            for (let x = 0; x < w; x++) if (data[(row * w + x) * 4 + 3] > 128){ bottom = row; break }
+          const baseline = Math.floor(y * density + 0.5)
+          assert.equal(bottom, baseline - 1, `${px}px at y=${y} ×${density}: glyphs end on row ${bottom}, expected ${baseline - 1}`)
+        }
+  })
+
+  describe("fontVariationSettings", () => {
+    let opaque = () => ctx.getImageData(0, 0, WIDTH, HEIGHT).data.filter((v, i) => i % 4 == 3 && v > 10).length
+    let ink = () => { ctx.clearRect(0, 0, WIDTH, HEIGHT); ctx.fillText("Hamburg", 20, 100); return opaque() }
+
+    test("CSS serialization", () => {
+      assert.equal(ctx.fontVariationSettings, "normal") // default
+
+      // sorted alphabetically by tag, double-quoted, minimal numbers
+      ctx.fontVariationSettings = '"wght" 625, "opsz" 48, "GRAD" -30'
+      assert.equal(ctx.fontVariationSettings, '"GRAD" -30, "opsz" 48, "wght" 625')
+
+      // repeated tag: last value wins
+      ctx.fontVariationSettings = '"wght" 400, "wght" 900'
+      assert.equal(ctx.fontVariationSettings, '"wght" 900')
+
+      // `normal` / empty clears
+      ctx.fontVariationSettings = "normal"
+      assert.equal(ctx.fontVariationSettings, "normal")
+      ctx.fontVariationSettings = '"wght" 700'
+      ctx.fontVariationSettings = ""
+      assert.equal(ctx.fontVariationSettings, "normal")
+    })
+
+    test("ignores malformed values", () => {
+      ctx.fontVariationSettings = '"wght" 700'
+      // each of these is invalid and should be a silent no-op (leaving the prior value intact)
+      ctx.fontVariationSettings = 'wght 700'     // tag not quoted
+      ctx.fontVariationSettings = '"wght"'       // missing value
+      ctx.fontVariationSettings = '"wg" 700'     // tag not 4 chars
+      ctx.fontVariationSettings = '"wght" abc'   // non-numeric value
+      assert.equal(ctx.fontVariationSettings, '"wght" 700')
+    })
+
+    test("{tag: value} objects", () => {
+      ctx.fontVariationSettings = {wght: 625, opsz: 48, GRAD: -30}
+      assert.equal(ctx.fontVariationSettings, '"GRAD" -30, "opsz" 48, "wght" 625')
+
+      // any invalid tag or value rejects the whole object (leaving the prior value)
+      ctx.fontVariationSettings = {wght: 700}
+      ctx.fontVariationSettings = {wg: 700}              // tag not 4 chars
+      // @ts-expect-error — values must be numbers
+      ctx.fontVariationSettings = {wght: "700"}          // string value
+      // @ts-expect-error — booleans are features-only
+      ctx.fontVariationSettings = {wght: true}           // booleans are features-only
+      ctx.fontVariationSettings = {wght: 900, opsz: NaN} // one bad entry
+      // @ts-expect-error — plain objects only
+      ctx.fontVariationSettings = new Map([["wght", 900]])
+      // @ts-expect-error — plain objects only
+      ctx.fontVariationSettings = [900]
+      ctx.fontVariationSettings = null
+      assert.equal(ctx.fontVariationSettings, '"wght" 700')
+
+      // an empty object clears, like `normal`
+      ctx.fontVariationSettings = {}
+      assert.equal(ctx.fontVariationSettings, "normal")
+    })
+
+    test("arbitrary axes", () => {
+      // Amstelvar exposes wght, opsz, wdth + custom axes (GRAD, XOPQ, …)
+      FontLibrary.use(findFont("AmstelvarAlpha-VF.ttf"))
+      ctx.font = "80px AmstelvarAlpha"
+
+      ctx.fontVariationSettings = '"wght" 100'
+      let light = ink()
+      ctx.fontVariationSettings = '"wght" 900'
+      let heavy = ink()
+      assert(heavy > light) // heavier axis lays down more ink
+
+      // a non-`wght` custom axis (GRAD = grade) also changes rendering
+      ctx.fontVariationSettings = '"GRAD" 88'
+      let lowGrade = ink()
+      ctx.fontVariationSettings = '"GRAD" 150'
+      let highGrade = ink()
+      assert(highGrade > lowGrade)
+    })
+
+    test("weight & stretch axes", () => {
+      FontLibrary.use(findFont("AmstelvarAlpha-VF.ttf"))
+
+      // font-weight says 100, but an explicit `wght` in the settings must win (CSS Fonts 4)
+      ctx.font = "100 80px AmstelvarAlpha"
+      let byWeight = ink()
+      ctx.fontVariationSettings = '"wght" 900'
+      let bySettings = ink()
+      assert(bySettings > byWeight)
+    })
+
+    test("font shorthand reset", () => {
+      ctx.fontVariationSettings = '"opsz" 48'
+      ctx.font = "40px serif"
+      assert.equal(ctx.fontVariationSettings, "normal")
+    })
+    test("optical sizing", () => {
+      // `opsz` is instanced from the pixel font size by default (48px -> opsz 48), matching browsers
+      // rather than converting to points; an explicit `opsz` overrides it (last-wins on duplicate axes)
+      FontLibrary.use(findFont("AmstelvarAlpha-VF.ttf"))
+      ctx.font = "48px AmstelvarAlpha"
+      let auto = ink()
+
+      ctx.fontVariationSettings = '"opsz" 48'
+      assert.equal(ink(), auto) // px passthrough: the 48px default matches an explicit opsz of 48
+
+      ctx.fontVariationSettings = '"opsz" 36'
+      assert(ink() != auto) // the pt interpretation (48*0.75=36) would differ
+
+      ctx.fontVariationSettings = '"opsz" 8'
+      assert(ink() != auto) // an explicit opsz overrides the automatic one
+    })
+  })
+
+  describe("fontVariant", () => {
+    test("defaults to normal", () => {
+      assert.equal(ctx.fontVariant, "normal")
+    })
+
+    test("single keywords", () => {
+      for (let kw of ["small-caps", "all-small-caps", "tabular-nums", "oldstyle-nums",
+                      "lining-nums", "discretionary-ligatures", "slashed-zero", "ordinal",
+                      "super", "sub"]){
+        ctx.fontVariant = kw
+        assert.equal(ctx.fontVariant, kw)
+      }
+    })
+
+    test("normal resets", () => {
+      ctx.fontVariant = "small-caps"
+      ctx.fontVariant = "normal"
+      assert.equal(ctx.fontVariant, "normal")
+    })
+
+    test("space-separated combos", () => {
+      ctx.fontVariant = "small-caps tabular-nums"
+      assert.equal(ctx.fontVariant, "small-caps tabular-nums")
+      ctx.fontVariant = "oldstyle-nums lining-nums"
+      assert.equal(ctx.fontVariant, "oldstyle-nums lining-nums")
+    })
+
+    test("parameterized alternates", () => {
+      for (let v of ["stylistic(2)", "styleset(3)", "swash(1)",
+                     "character-variant(4)", "ornaments(1)", "annotation(1)"]){
+        ctx.fontVariant = v
+        assert.equal(ctx.fontVariant, v)
+      }
+    })
+
+    test("applies to shaping", () => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "40px TestFace"
+      let text = "0123456789",
+          base = ctx.measureText(text).width
+      ctx.fontVariant = "tabular-nums"
+      let tnum = ctx.measureText(text).width
+      assert(tnum > base, `expected tabular-nums width (${tnum}) > proportional width (${base})`)
+    })
+
+    test("ignores invalid values", () => {
+      ctx.fontVariant = "small-caps"
+      assert.doesNotThrow(() => { ctx.fontVariant = "bogus" })
+      assert.equal(ctx.fontVariant, "small-caps")
+    })
+
+    test("rejects an all-or-nothing combo", () => {
+      ctx.fontVariant = "tabular-nums"
+      ctx.fontVariant = "small-caps bogus"
+      assert.equal(ctx.fontVariant, "tabular-nums")
+    })
+  })
+
+  describe("fontFeatureSettings", () => {
+    let width = str => ctx.measureText(str).width
+
+    test("CSS serialization", () => {
+      assert.equal(ctx.fontFeatureSettings, "normal") // default
+
+      // tag-sorted, double-quoted; an omitted value defaults to `on` (1)
+      ctx.fontFeatureSettings = '"tnum" 1, "liga" 0, "ss01"'
+      assert.equal(ctx.fontFeatureSettings, '"liga" 0, "ss01" 1, "tnum" 1')
+
+      // last value wins for a repeated tag; `on`/`off` keywords map to 1/0
+      ctx.fontFeatureSettings = '"liga" 1, "liga" off'
+      assert.equal(ctx.fontFeatureSettings, '"liga" 0')
+
+      // `normal`/`""` clear it
+      ctx.fontFeatureSettings = "normal"
+      assert.equal(ctx.fontFeatureSettings, "normal")
+
+      // a malformed entry rejects the whole string (leaving the prior value)
+      ctx.fontFeatureSettings = '"liga" 1'
+      ctx.fontFeatureSettings = 'liga 1'     // tag not quoted
+      ctx.fontFeatureSettings = '"lig" 1'    // tag not 4 chars
+      ctx.fontFeatureSettings = '"liga" -1'  // negative value
+      assert.equal(ctx.fontFeatureSettings, '"liga" 1')
+    })
+
+    test("{tag: value} objects", () => {
+      // booleans map to 1/0
+      ctx.fontFeatureSettings = {tnum: true, liga: false, ss01: 1, salt: 3}
+      assert.equal(ctx.fontFeatureSettings, '"liga" 0, "salt" 3, "ss01" 1, "tnum" 1')
+
+      // any invalid tag or value rejects the whole object (leaving the prior value)
+      ctx.fontFeatureSettings = {liga: 1}
+      ctx.fontFeatureSettings = {lig: 1}             // tag not 4 chars
+      ctx.fontFeatureSettings = {liga: -1}           // negative value
+      ctx.fontFeatureSettings = {liga: 1.5}          // non-integer value
+      // @ts-expect-error — keywords are string-form only
+      ctx.fontFeatureSettings = {liga: "on"}         // keywords are string-form only
+      ctx.fontFeatureSettings = {tnum: 1, liga: -1}  // one bad entry
+      ctx.fontFeatureSettings = null
+      assert.equal(ctx.fontFeatureSettings, '"liga" 1')
+
+      // an empty object clears, like `normal`
+      ctx.fontFeatureSettings = {}
+      assert.equal(ctx.fontFeatureSettings, "normal")
+    })
+
+    test("font shorthand reset", () => {
+      FontLibrary.use("Montserrat", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "100px Montserrat"
+      let text = "AVAWAToTa"
+
+      let on = width(text)
+      ctx.fontFeatureSettings = '"kern" 0' // disabling kerning widens a kerned run
+      assert(width(text) > on)
+
+      ctx.font = "100px Montserrat" // the shorthand resets feature settings to normal
+      assert.equal(ctx.fontFeatureSettings, "normal")
+      assert.nearEqual(width(text), on)
+    })
+
+    test("fontVariant & fontKerning conflicts", () => {
+      FontLibrary.use("Montserrat", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "100px Montserrat"
+      let text = "AVAWAToTa"
+
+      // explicit `kern` beats fontKerning (the experts-only escape hatch has the final word)
+      let kerned = width(text)
+      ctx.fontKerning = "none"
+      assert(width(text) > kerned)
+      ctx.fontFeatureSettings = '"kern" 1'
+      assert.nearEqual(width(text), kerned)
+
+      // explicit `tnum` beats fontVariant's opposite setting
+      ctx.font = "100px Montserrat" // reset kerning-adjacent state
+      ctx.fontFeatureSettings = '"tnum" 0'
+      let proportional = width("1")
+      ctx.fontVariant = "tabular-nums"       // would set tnum=1
+      ctx.fontFeatureSettings = '"tnum" 0'   // …but the low-level setting overrides it
+      assert.nearEqual(width("1"), proportional)
+    })
+
+    test("fontVariant composition", () => {
+      FontLibrary.use("Montserrat", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "100px Montserrat"
+      let text = "AVAWAToTa"
+      let kernOn = width(text)
+
+      ctx.fontVariant = "tabular-nums"     // tnum=1 -> equal digit advances
+      ctx.fontFeatureSettings = '"kern" 0' // a different feature; both must apply
+      assert.nearEqual(width("1"), width("4")) // variant (tnum) still in effect
+      assert(width(text) > kernOn)             // settings (kern off) also in effect
+    })
+  })
+
+  describe("fontInstance", () => {
+    let width = () => ctx.measureText("Hamburgefonstiv").width
+    let widthAt = font => { ctx.font = font; return width() }
+
+    beforeEach(() => {
+      FontLibrary.use("Geomini", [findFont("Geomini-VF.ttf")]) // `wght` instances from ExtraLight (200) to ExtraBold (800)
+    })
+
+    test("font shorthand reset", () => {
+      assert.equal(ctx.fontInstance, "auto") // default
+
+      ctx.font = "40px Geomini"
+      ctx.fontInstance = "Light"
+      assert.equal(ctx.fontInstance, "Light")
+
+      // part of the drawing state (and unaffected by an invalid font)
+      ctx.save()
+      ctx.fontInstance = "Bold"
+      ctx.restore()
+      ctx.font = "not a font"
+      assert.equal(ctx.fontInstance, "Light")
+
+      ctx.font = "40px Geomini"
+      assert.equal(ctx.fontInstance, "auto")
+    })
+
+    test("precedence", () => {
+      let [light, bold] = [widthAt("300 40px Geomini"), widthAt("bold 40px Geomini")]
+      assert(light < bold)
+
+      ctx.fontInstance = "Light"
+      assert.nearEqual(width(), light)
+
+      ctx.fontVariationSettings = {wght: 700}
+      assert.nearEqual(width(), bold)
+    })
+
+    test("normalized names", () => {
+      let light = widthAt("300 40px Geomini")
+      ctx.font = "40px Geomini"
+      ctx.fontInstance = "LIGHT"
+      assert.equal(ctx.fontInstance, "Light") // reported as spelled in the font
+      assert.nearEqual(width(), light)
+
+      ctx.fontInstance = "auto"
+      ctx.fontInstance = " light "
+      assert.equal(ctx.fontInstance, "Light")
+    })
+
+    test("separate italic face", () => {
+      FontLibrary.use("Raleway", [findFont("Raleway-VariableFont_wght.ttf"), findFont("Raleway-Italic-VariableFont_wght.ttf")])
+      let withInstance = (font, name) => { ctx.font = font; ctx.fontInstance = name; return width() }
+      let [bold, boldItalic] = [withInstance("40px Raleway", "Bold"), withInstance("italic 40px Raleway", "Bold Italic")]
+      assert(bold != boldItalic)
+
+      // an instance defined by another of the family's faces overrides the font's style (in either direction)
+      assert.nearEqual(withInstance("40px Raleway", "Bold Italic"), boldItalic)
+      assert.equal(ctx.fontInstance, "Bold Italic")
+      assert.nearEqual(withInstance("italic 40px Raleway", "Bold"), bold)
+    })
+
+    test("mixed static & variable faces", () => {
+      // Montserrat's static 400-weight italic outranks Raleway's variable italic (registered at weight 100) when matching
+      FontLibrary.use("Mixed", [
+        findFont("Raleway-VariableFont_wght.ttf"),
+        findFont("Raleway-Italic-VariableFont_wght.ttf"),
+        findFont("montserrat-latin/montserrat-v30-latin-italic.woff2"),
+      ])
+      let withInstance = (font, name) => { ctx.font = font; ctx.fontInstance = name; return width() }
+      let [bold, lightItalic] = [widthAt("bold 40px Mixed"), widthAt("italic 300 40px Mixed")]
+
+      // instances are found in the family's variable faces regardless of the font's weight or style
+      assert.nearEqual(withInstance("40px Mixed", "Light Italic"), lightItalic)
+      assert.nearEqual(withInstance("italic 40px Mixed", "Bold"), bold) // the static italic face is skipped
+      assert.equal(ctx.fontInstance, "Bold")
+    })
+
+    test("unknown names", () => {
+      let light = widthAt("300 40px Geomini")
+      ctx.font = "bold 40px Geomini"
+      ctx.fontInstance = "Light"
+
+      // the current instance is left in place
+      ctx.fontInstance = "Light Italic"
+      assert.equal(ctx.fontInstance, "Light")
+      assert.nearEqual(width(), light)
+
+      // like any string attribute, other values are stringified (so this is just another unknown name)
+      // @ts-expect-error — names are typed as strings
+      ctx.fontInstance = 300
+      assert.equal(ctx.fontInstance, "Light")
+      assert.nearEqual(width(), light)
+
+      ctx.fontInstance = "auto"
+      assert.equal(ctx.fontInstance, "auto")
+    })
+  })
+
+  describe("fontStretch", () => {
+    test("defaults to normal", () => {
+      assert.equal(ctx.fontStretch, "normal")
+    })
+
+    test("parses keywords and percent", () => {
+      /** @type {Array<import('../../lib').CanvasRenderingContext2D['fontStretch']>} */
+      let keywords = ["ultra-condensed", "extra-condensed", "condensed", "semi-condensed",
+                      "semi-expanded", "expanded", "extra-expanded", "ultra-expanded", "normal"]
+      for (let kw of keywords){
+        ctx.fontStretch = kw
+        assert.equal(ctx.fontStretch, kw)
+      }
+
+      // a percentage that lands exactly on a named bucket normalizes to the keyword…
+      ctx.fontStretch = "75%"
+      assert.equal(ctx.fontStretch, "condensed")
+      ctx.fontStretch = "100%"
+      assert.equal(ctx.fontStretch, "normal")
+
+      // …but an off-bucket percentage stays a percentage
+      ctx.fontStretch = "83%"
+      assert.equal(ctx.fontStretch, "83%")
+    })
+
+    test("variable wdth axis", () => {
+      // Amstelvar's wdth axis ranges 35–100 (condenses only)
+      FontLibrary.use(findFont("AmstelvarAlpha-VF.ttf"))
+      ctx.font = "80px AmstelvarAlpha"
+
+      ctx.fontStretch = "normal"
+      let wide = ctx.measureText("Hamburg").width
+      ctx.fontStretch = "50%"
+      let narrow = ctx.measureText("Hamburg").width
+      assert(narrow < wide) // condensing the width axis shrinks the advance
+    })
+
+    test("ignores invalid values", () => {
+      ctx.fontStretch = "condensed"
+      assert.doesNotThrow(() => {
+        ctx.fontStretch = "bogus"
+      })
+      assert.equal(ctx.fontStretch, "condensed")
+    })
+  })
+
+  describe("letterSpacing / wordSpacing", () => {
+    test("default to 0px", () => {
+      assert.equal(ctx.letterSpacing, "0px")
+      assert.equal(ctx.wordSpacing, "0px")
+    })
+
+    test("absolute units", () => {
+      for (let len of ["5px", "2pt", "1pc", "0.5cm", "10q"]){
+        ctx.letterSpacing = len
+        assert.equal(ctx.letterSpacing, len)
+        ctx.wordSpacing = len
+        assert.equal(ctx.wordSpacing, len)
+      }
+    })
+
+    test("em / rem units", () => {
+      ctx.letterSpacing = "0.1em"
+      assert.equal(ctx.letterSpacing, "0.1em")
+      ctx.wordSpacing = "1rem"
+      assert.equal(ctx.wordSpacing, "1rem")
+    })
+
+    test("em tracks font size", () => {
+      // 1em of letter-spacing should widen text twice as much at 40px as at 20px
+      ctx.letterSpacing = "1em"
+      ctx.font = "40px serif"
+      let wide = ctx.measureText("abc").width
+      ctx.font = "20px serif"
+      let narrow = ctx.measureText("abc").width
+      assert(wide > narrow, `expected 40px spacing (${wide}) > 20px spacing (${narrow})`)
+    })
+
+    test("rem tracks a 16px root", () => {
+      // rem is root-relative, so 1rem == 16px regardless of the font size (unlike em above)
+      for (let px of ["40px", "10px"]){
+        ctx.font = `${px} serif`
+        ctx.letterSpacing = "1rem"
+        let rem = ctx.measureText("abc").width
+        ctx.letterSpacing = "16px"
+        let px16 = ctx.measureText("abc").width
+        assert.nearEqual(rem, px16)
+      }
+    })
+
+    test("unitless zero", () => {
+      // a bare 0 is a valid <length>, unlike every other unitless number
+      for (let zero of ["0", "+0", "-0", "0.0", ".0"]){
+        ctx.letterSpacing = "4px"
+        ctx.letterSpacing = zero
+        assert.equal(ctx.letterSpacing, "0px", `${zero} should reset letterSpacing`)
+        ctx.wordSpacing = "4px"
+        ctx.wordSpacing = zero
+        assert.equal(ctx.wordSpacing, "0px", `${zero} should reset wordSpacing`)
+      }
+      ctx.letterSpacing = "4px"
+      ctx.letterSpacing = "1"
+      assert.equal(ctx.letterSpacing, "4px")
+    })
+
+    test("unresolvable units", () => {
+      ctx.letterSpacing = "4px"
+      for (let bad of ["10%", "2ex", "3ch"]){
+        ctx.letterSpacing = bad
+        assert.equal(ctx.letterSpacing, "4px", `${bad} should have been ignored`)
+      }
+    })
+
+    test("ignores invalid values", () => {
+      ctx.wordSpacing = "6px"
+      assert.doesNotThrow(() => { ctx.wordSpacing = "bogus" })
+      assert.equal(ctx.wordSpacing, "6px")
+    })
+  })
+
+  describe("textDecoration", () => {
+    describe("parsing", () => {
+        test("defaults to none", () => {
+          assert.equal(ctx.textDecoration, "none")
+        })
+
+        test("a bare line keyword", () => {
+          // a decoration with no explicit color uses `currentColor`; it must still apply rather than
+          // being dropped as "invalid" (regression: underline-alone previously round-tripped to "none")
+          for (let line of ["underline", "overline", "line-through"]){
+            ctx.textDecoration = "none"
+            ctx.textDecoration = line
+            assert.equal(ctx.textDecoration, line)
+          }
+        })
+
+        test("a line + style + color combo", () => {
+          ctx.textDecoration = "underline wavy red"
+          assert.equal(ctx.textDecoration, "underline wavy red")
+        })
+
+        test("a wide-gamut color", () => {
+          ctx.textDecoration = "line-through oklch(0.7 0.1 200)"
+          assert.equal(ctx.textDecoration, "line-through oklch(0.7 0.1 200)")
+        })
+
+        test("ignores junk", () => {
+          // junk must no-op (retain the prior decoration), not reset to "none": a single unrecognized
+          // token, an unparseable color, and junk hidden behind a valid color
+          ctx.textDecoration = "underline wavy red"
+          for (let junk of ["blahblah", "underline blahblah", "notaword blue"]){
+            ctx.textDecoration = junk
+            assert.equal(ctx.textDecoration, "underline wavy red", `"${junk}" should be ignored`)
+          }
+        })
+
+        test("none resets", () => {
+          ctx.textDecoration = "underline"
+          ctx.textDecoration = "none"
+          assert.equal(ctx.textDecoration, "none")
+        })
+      })
+
+    describe("rendering", () => {
+      const W = 300, H = 120, BASELINE = 70, FONT = "40px TestFace"
+
+      // a bundled face, not a system one: Helvetica isn't installed on Linux and isn't reliably
+      // substituted on Windows, and the sample bands below are tuned to the font's underline
+      // position and x-height — so a substitution would silently move the ink out of the band.
+      // Registered under an alias the host can't also have installed: using the font's real name
+      // would merge with a system copy of it (and quietly prefer that copy's faces).
+      // The outer afterEach resets the library, so re-register for each test.
+      beforeEach(() => {
+        FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+        assert(FontLibrary.has("TestFace"), "the bundled face should be registered for each test")
+      })
+
+      // Count dark pixels within a horizontal band [y0,y1). "mmmm" has no ascenders/descenders,
+      // so the rows just above the glyphs and just below the baseline are otherwise empty —
+      // any ink there comes from an over/underline.
+      function inkInBand(decoration, y0, y1, {text = "mmmm", channel = null} = {}){
+        const canvas = new Canvas(W, H)
+        const ctx = canvas.getContext('2d')
+        ctx.fillStyle = 'white'; ctx.fillRect(0, 0, W, H)
+        ctx.fillStyle = 'black'
+        ctx.font = FONT
+        ctx.textBaseline = 'alphabetic'
+        if (decoration) ctx.textDecoration = decoration
+        ctx.fillText(text, 20, BASELINE)
+
+        const {data} = ctx.getImageData(0, 0, W, H)
+        let n = 0
+        for (let y = y0; y < y1; y++) for (let x = 0; x < W; x++){
+          const i = (y*W + x) * 4
+          if (channel !== null){ if (data[i+channel] > 100 && data[i+3] > 128) n++ }
+          else if (data[i] < 128 && data[i+3] > 128) n++
+        }
+        return n
+      }
+
+      test("underline", () => {
+        const plain = inkInBand(null, BASELINE+2, BASELINE+14)
+        const lined = inkInBand("underline", BASELINE+2, BASELINE+14)
+        assert.equal(plain, 0, "expected no ink below baseline without a decoration")
+        assert(lined > 0, "expected underline ink below the baseline")
+      })
+
+      test("overline", () => {
+        const plain = inkInBand(null, 22, 42)
+        const lined = inkInBand("overline", 22, 42)
+        assert.equal(plain, 0, "expected no ink above the glyphs without a decoration")
+        assert(lined > 0, "expected overline ink above the glyphs")
+      })
+
+      test("line styles", () => {
+        for (const style of ["", "double", "dotted", "dashed", "wavy"]){
+          assert(inkInBand(`underline ${style}`.trim(), BASELINE+1, BASELINE+18) > 0,
+            `expected ink for underline ${style || "solid"}`)
+        }
+      })
+
+      test("explicit color", () => {
+        // a blue underline must leave blue (not black) pixels below the baseline
+        assert(inkInBand("underline blue", BASELINE+2, BASELINE+14, {channel: 2}) > 0,
+          "expected blue underline pixels")
+      })
+
+      test("descender gaps", () => {
+        // within the underline's inked span, descender glyphs leave gaps; plain glyphs don't
+        const underlineGaps = (text) => {
+          const canvas = new Canvas(W, H)
+          const ctx = canvas.getContext('2d')
+          ctx.fillStyle = 'white'; ctx.fillRect(0, 0, W, H)
+          ctx.fillStyle = 'black'; ctx.font = FONT; ctx.textBaseline = 'alphabetic'
+          ctx.textDecoration = 'underline'
+          ctx.fillText(text, 20, BASELINE)
+          const {data} = ctx.getImageData(0, 0, W, H)
+          const inked = (x) => {
+            for (let y = BASELINE+2; y < BASELINE+7; y++){
+              const i = (y*W + x) * 4
+              if (data[i] < 128 && data[i+3] > 128) return true
+            }
+            return false
+          }
+          let first = -1, last = -1
+          for (let x = 0; x < W; x++) if (inked(x)){ if (first < 0) first = x; last = x }
+          if (first < 0) return 0
+          let empties = 0
+          for (let x = first; x <= last; x++) if (!inked(x)) empties++
+          return empties
+        }
+        assert(underlineGaps("pqjy") > 0, "expected the underline to break under descenders")
+        assert.equal(underlineGaps("mmmm"), 0, "expected a continuous underline with no descenders")
+      })
+
+      test("leading descenders", () => {
+        // skparagraph draws straight through a descender hugging the line's start; we gap it.
+        // 'june' has exactly one descender — the leading 'j' — so the underline picks up a gap
+        // under the leading glyph, while 'nune' (no descenders) stays continuous there.
+        const gapsUnderLeadGlyph = (text) => {
+          const canvas = new Canvas(W, H)
+          const ctx = canvas.getContext('2d')
+          ctx.fillStyle = 'white'; ctx.fillRect(0, 0, W, H)
+          ctx.fillStyle = 'black'; ctx.font = FONT; ctx.textBaseline = 'alphabetic'
+          ctx.textDecoration = 'underline'
+          ctx.fillText(text, 20, BASELINE)
+          const {data} = ctx.getImageData(0, 0, W, H)
+          const inked = (x) => {
+            for (let y = BASELINE+2; y < BASELINE+7; y++){
+              const i = (y*W + x) * 4
+              if (data[i] < 128 && data[i+3] > 128) return true
+            }
+            return false
+          }
+          // ink-free columns after the underline first appears, within the leading glyph (~x20–34)
+          let seen = false, gaps = 0
+          for (let x = 20; x < 34; x++){ if (inked(x)) seen = true; else if (seen) gaps++ }
+          return gaps
+        }
+        assert(gapsUnderLeadGlyph("june") > 0, "expected the leading 'j' descender to be skipped")
+        assert.equal(gapsUnderLeadGlyph("nune"), 0, "expected no gap under a leading non-descender")
+      })
+
+      test("line-through", () => {
+        // between the strokes of "l l" the mid-height row is empty until a line-through fills it
+        const plain = inkInBand(null, BASELINE-16, BASELINE-10, {text: "l l l"})
+        const struck = inkInBand("line-through", BASELINE-16, BASELINE-10, {text: "l l l"})
+        assert(struck > plain, "expected line-through to add ink across the gaps")
+      })
+
+      test("follows fontSmoothing", () => {
+        // draw only the rule (transparent glyphs, explicit decoration color) at a fractional baseline
+        // so an antialiased rule has to split its coverage between two rows
+        function partialPixels(fontSmoothing){
+          const canvas = new Canvas(W, H)
+          canvas.gpu = false // GPU surfaces default to 4x MSAA, which softens every edge regardless
+          const ctx = canvas.getContext('2d')
+          Object.assign(ctx, {font: FONT, textDecoration: "underline black", fillStyle: "rgba(0,0,0,0)", fontSmoothing})
+          ctx.fillText("mmmm", 20, BASELINE + 0.4)
+          const {data} = ctx.getImageData(0, 0, W, H)
+          let partial = 0, opaque = 0
+          for (let i = 3; i < data.length; i += 4){
+            if (data[i] > 0 && data[i] < 255) partial++
+            else if (data[i] === 255) opaque++
+          }
+          return {partial, opaque}
+        }
+
+        const smoothed = partialPixels(true), aliased = partialPixels(false)
+        assert(smoothed.partial > 0, "an antialiased underline should have partially-covered pixels")
+        assert.equal(aliased.partial, 0, "an aliased underline should not be antialiased")
+        assert(aliased.opaque > 0, "the aliased underline should still be drawn")
+      })
+
+      test("trailing whitespace", () => {
+        // draw only the rule (transparent glyphs) and find its horizontal extent relative to the anchor
+        function ruleExtent(text, opts){
+          const canvas = new Canvas(W, H)
+          canvas.gpu = false
+          const ctx = canvas.getContext('2d')
+          Object.assign(ctx, {font: "20px TestFace", textDecoration: "underline black", fillStyle: "rgba(0,0,0,0)", ...opts})
+          ctx.fillText(text, 150, BASELINE, opts.maxWidth)
+          const {data} = ctx.getImageData(0, 0, W, H)
+          let left = W, right = 0
+          for (let y = 0; y < H; y++) for (let x = 0; x < W; x++)
+            if (data[(y*W + x) * 4 + 3] > 127){ left = Math.min(left, x); right = Math.max(right, x + 1) }
+          ctx.textWrap = false
+          return {left: left - 150, right: right - 150, width: ctx.measureText(text).width}
+        }
+
+        for (const textAlign of /** @type {const} */ (["left", "right"]))
+        for (const direction of /** @type {const} */ (["ltr", "rtl"]))
+        for (const letterSpacing of ["0px", "3px"]){
+          // a single line's trailing spaces count toward its width, so they're underlined too
+          const spaced = ruleExtent("Quick fox  ", {textAlign, direction, letterSpacing})
+          assert.nearEqual(spaced.right - spaced.left, spaced.width, 1.5)
+          // in wrapped text they hang past the end of the line instead, and stay bare
+          const wrapped = ruleExtent("Quick fox  ", {textAlign, direction, letterSpacing, textWrap: true, maxWidth: 250})
+          const trimmed = ruleExtent("Quick fox", {textAlign, direction, letterSpacing})
+          assert.nearEqual(wrapped.right - wrapped.left, trimmed.right - trimmed.left, 1)
+        }
+      })
+
+      describe("inherits the text's fill", () => {
+        const Y0 = BASELINE + 2, Y1 = BASELINE + 14   // underline band (below the m's, no descenders)
+
+        // render "mmmm" with a caller-supplied fill (color/gradient/pattern) + decoration
+        function render(makeFill, decoration, text = "mmmm"){
+          const canvas = new Canvas(W, H)
+          const ctx = canvas.getContext('2d')
+          ctx.fillStyle = 'white'; ctx.fillRect(0, 0, W, H)
+          ctx.font = FONT; ctx.textBaseline = 'alphabetic'
+          ctx.fillStyle = makeFill(ctx)
+          if (decoration) ctx.textDecoration = decoration
+          ctx.fillText(text, 20, BASELINE)
+          return ctx.getImageData(0, 0, W, H)
+        }
+        // mean color of the opaque, non-white pixels in a band [y0,y1) × [x0,x1)
+        function bandColor({data}, y0, y1, x0 = 0, x1 = W){
+          let r = 0, g = 0, b = 0, n = 0
+          for (let y = y0; y < y1; y++) for (let x = Math.floor(x0); x < x1; x++){
+            const i = (y*W + x) * 4
+            if (data[i+3] > 128 && !(data[i] > 240 && data[i+1] > 240 && data[i+2] > 240)){
+              r += data[i]; g += data[i+1]; b += data[i+2]; n++
+            }
+          }
+          return { r: n ? r/n : 0, g: n ? g/n : 0, b: n ? b/n : 0, n }
+        }
+        // first/last inked column of the underline, for left/right sampling
+        function extent({data}, y0, y1){
+          let lo = -1, hi = -1
+          for (let x = 0; x < W; x++) for (let y = y0; y < y1; y++){
+            const i = (y*W + x) * 4
+            if (data[i+3] > 128 && !(data[i] > 240 && data[i+1] > 240 && data[i+2] > 240)){
+              if (lo < 0) lo = x; hi = x; break
+            }
+          }
+          return { lo, hi }
+        }
+        const gradient = ctx => {
+          const g = ctx.createLinearGradient(20, 0, 160, 0)
+          g.addColorStop(0, 'red'); g.addColorStop(1, 'blue')
+          return g
+        }
+
+        test("from a gradient", () => {
+          const img = render(gradient, 'underline')
+          const { lo, hi } = extent(img, Y0, Y1)
+          assert(hi > lo, "expected an inked underline")
+          const third = (hi - lo) / 3
+          const left = bandColor(img, Y0, Y1, lo, lo + third)
+          const right = bandColor(img, Y0, Y1, hi - third, hi)
+          assert(left.r > left.b, "the underline's left end should follow the gradient's red")
+          assert(right.b > right.r, "the underline's right end should follow the gradient's blue")
+          assert(left.r > 80 && right.b > 80, "the underline should carry the fill's color, not be solid black")
+        })
+
+        test("from a pattern", () => {
+          const pattern = ctx => {
+            const tile = new Canvas(8, 8), t = tile.getContext('2d')
+            t.fillStyle = 'red'; t.fillRect(0, 0, 8, 8)
+            return ctx.createPattern(tile, 'repeat')
+          }
+          const c = bandColor(render(pattern, 'underline'), Y0, Y1)
+          assert(c.n > 0, "expected an inked underline")
+          assert(c.r > c.g && c.r > c.b, "the underline should pick up the pattern's red, not be black")
+        })
+
+        test("from a solid color", () => {
+          const c = bandColor(render(() => 'green', 'underline'), Y0, Y1)
+          assert(c.n > 0, "expected an inked underline")
+          assert(c.g > c.r && c.g > c.b, "the underline should match the green fill")
+        })
+
+        test("unless textDecorationColor overrides", () => {
+          const img = render(gradient, 'underline lime')
+          const { lo, hi } = extent(img, Y0, Y1)
+          const third = (hi - lo) / 3
+          const left = bandColor(img, Y0, Y1, lo, lo + third)
+          const right = bandColor(img, Y0, Y1, hi - third, hi)
+          // solid lime everywhere — green-dominant on BOTH ends, no red→blue ramp
+          assert(left.g > left.r && left.g > left.b, "the explicit color should win at the left, not the gradient")
+          assert(right.g > right.r && right.g > right.b, "the explicit color should win at the right, not the gradient")
+        })
+
+        test("on a line-through too", () => {
+          // the strike sits mid-glyph; sample it across the gaps in "l l l"
+          const c = bandColor(render(gradient, 'line-through', 'l l l'), BASELINE-16, BASELINE-10)
+          assert(c.n > 0, "expected an inked line-through")
+          assert(c.r > 40 || c.b > 40, "the strike should carry the fill's color, not be solid black")
+        })
+      })
+    })
+  })
+
+  describe("textAlign", () => {
+    test("edge whitespace", () => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "20px TestFace"
+      for (const direction of /** @type {const} */ (["ltr", "rtl"])){
+        ctx.direction = direction
+        for (const text of ["Quick fox", " Quick fox ", "Quick fox  ", "  Quick fox"]){
+          const left = (ctx.textAlign = "left", ctx.outlineText(text).bounds.left),
+                right = (ctx.textAlign = "right", ctx.outlineText(text).bounds.left),
+                center = (ctx.textAlign = "center", ctx.outlineText(text).bounds.left),
+                {width} = ctx.measureText(text)
+          // like Chrome: the box from `x` to `x ± width` is what's aligned, whitespace and all
+          assert.nearEqual(left - right, width, 1e-4)
+          assert.nearEqual(left - center, width / 2, 1e-4)
+        }
+      }
+    })
+
+    test("letterSpacing", () => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "20px TestFace"
+      const inkLeft = (text, ls, textAlign) => {
+        Object.assign(ctx, {letterSpacing: ls, textAlign})
+        return ctx.outlineText(text).bounds.left
+      }
+      for (const direction of /** @type {const} */ (["ltr", "rtl"])){
+        ctx.direction = direction
+        for (const ls of ["3px", "-1px", "0.5em"]){
+          for (const text of ["H", "Quick fox"]){
+            // spacing follows every glyph, so the first one stays on the anchor…
+            assert.nearEqual(inkLeft(text, ls, "left"), inkLeft(text, "0px", "left"), 1e-4)
+            // …and right/center alignment move the text by its full (spaced) width
+            ctx.letterSpacing = ls
+            const {width} = ctx.measureText(text)
+            assert.nearEqual(inkLeft(text, ls, "left") - inkLeft(text, ls, "right"), width, 1e-4)
+            assert.nearEqual(inkLeft(text, ls, "left") - inkLeft(text, ls, "center"), width / 2, 1e-4)
+          }
+        }
+      }
+    })
+
+    test("fractional widths", () => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      ctx.font = "17.3px TestFace"
+      // skparagraph's rounding hack would snap every width to a multiple of 0.01px
+      const widths = ["Quick fox", "Hgjy", "The lazy dog"].map(t => ctx.measureText(t).width)
+      assert(widths.some(w => Math.abs(w * 100 - Math.round(w * 100)) > 1e-3), `widths ${widths} all look rounded`)
+    })
+
+    test("multi-line text", () => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      // the Arabic line has no non-cursive cluster, so skparagraph doesn't nudge it by half a letter-space
+      // like the others; every line should still land exactly where it would if drawn by itself
+      const lines = ["Hgjy fox", "abc", "مرحبا"], text = lines.join("\n")
+      const inkX = m => [m.actualBoundingBoxLeft, m.actualBoundingBoxRight]
+      for (const direction of /** @type {const} */ (["ltr", "rtl"]))
+      for (const textAlign of /** @type {const} */ (["left", "right", "center"]))
+      for (const letterSpacing of ["0px", "3px"]){
+        Object.assign(ctx, {font: "20px TestFace", direction, textAlign, letterSpacing})
+        ctx.textWrap = false
+        const alone = lines.map(line => ctx.measureText(line))
+        ctx.textWrap = true
+        for (const maxWidth of [undefined, 500]){
+          ctx.measureText(text, maxWidth).lines.forEach((line, i) => {
+            const [left, right] = inkX(alone[i])
+            assert.nearEqual(line.x, -left, 1e-3)
+            assert.nearEqual(line.x + line.width, right, 1e-3)
+          })
+        }
+      }
+    })
+  })
+
+  describe("textRendering", () => {
+    const MODES = /** @type {const} */ (["auto", "optimizeSpeed", "optimizeLegibility", "geometricPrecision"])
+    const same = (a, b) => a.length == b.length && a.every((v, i) => v == b[i])
+
+    beforeEach(() => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+    })
+
+    /** @param {number} x @param {number} y @param {string} [text] */
+    const render = (x, y, text = "H") => {
+      ctx.clearRect(0, 0, WIDTH, HEIGHT)
+      ctx.font = '11px TestFace'
+      ctx.fillText(text, x, y)
+      return ctx.getImageData(0, 0, WIDTH, HEIGHT).data
+    }
+    // an axis is snapped when every quarter-pixel nudge of a glyph renders like either the un-nudged glyph or
+    // the glyph nudged by a whole pixel; otherwise the nudges produce their own glyph images (a single glyph,
+    // since in a string each glyph rounds its own fractional position)
+    const snappedX = () => { const [b0, b1] = [render(10, 24), render(11, 24)]; return [1, 2, 3].every(k => { const b = render(10 + k/4, 24); return same(b, b0) || same(b, b1) }) }
+    const snappedY = () => { const [b0, b1] = [render(10, 24), render(10, 25)]; return [1, 2, 3].every(k => { const b = render(10, 24 + k/4); return same(b, b0) || same(b, b1) }) }
+
+    test("enum values", () => {
+      assert.equal(ctx.textRendering, "auto")
+      for (const mode of MODES){
+        ctx.textRendering = mode
+        assert.equal(ctx.textRendering, mode)
+      }
+      // @ts-expect-error — deliberately invalid: enum attributes ignore unknown values
+      ctx.textRendering = "crisp"
+      assert.equal(ctx.textRendering, "geometricPrecision")
+
+      ctx.save()
+      ctx.textRendering = "optimizeSpeed"
+      ctx.restore()
+      assert.equal(ctx.textRendering, "geometricPrecision")
+    })
+
+    test("auto", () => {
+      ctx.textRendering = "auto"
+      assert(!snappedX(), "horizontal nudges should produce distinct glyph images")
+      assert(snappedY(), "vertical nudges should snap to whole pixels")
+    })
+
+    test("optimizeSpeed", () => {
+      ctx.textRendering = "optimizeSpeed"
+      assert(snappedX())
+      assert(snappedY())
+      const TEXT = "Illegible waveforms 10x"
+      let data = render(10.5, 24.5, TEXT), partial = 0
+      for (let i = 3; i < data.length; i += 4) if (data[i] > 0 && data[i] < 255) partial++
+      assert(partial > 0, "glyph edges should still be antialiased")
+
+      // aliased text is whole-pixel in every mode, so switching modes can't change it
+      ctx.fontSmoothing = false
+      let aliased = render(10.5, 24.5, TEXT)
+      ctx.textRendering = "auto"
+      assert(same(render(10.5, 24.5, TEXT), aliased))
+      ctx.fontSmoothing = true
+    })
+
+    test("optimizeLegibility", () => {
+      // CoreGraphics font smoothing on macOS, light autohinting on FreeType (DirectWrite grid fitting is
+      // unverified, hence the win32 escape hatch); layout is untouched either way (see the next test)
+      const TEXT = "Illegible waveforms 10x"
+      ctx.textRendering = "auto"
+      let plain = render(10, 24, TEXT)
+      ctx.textRendering = "optimizeLegibility"
+      if (os.platform() != 'win32'){
+        assert(!same(render(10, 24, TEXT), plain))
+      }
+      ctx.textRendering = "auto"
+      assert(same(render(10, 24, TEXT), plain))
+    })
+
+    test("geometricPrecision", () => {
+      ctx.textRendering = "geometricPrecision"
+      assert(!snappedX())
+      assert(!snappedY(), "vertical nudges should produce distinct glyph images")
+    })
+
+    test("layout is unaffected", () => {
+      // the modes are applied to each run's font just before drawing, so shaping, metrics, outlines
+      // and vector output are identical across all of them (and switching modes needn't flush the layout caches)
+      const TEXT = "Illegible waveforms 10x, fluffy fjords"
+      /** @param {typeof MODES[number]} mode */
+      const snapshot = (mode) => {
+        const canvas = new Canvas(400, 100), ctx = canvas.getContext("2d")
+        Object.assign(ctx, {font: '23px TestFace', textRendering: mode})
+        ctx.fillText(TEXT, 20, 60)
+        const pdf = hasPdftotext ? (() => {
+          const file = path.join(os.tmpdir(), `skia-canvas-tr-${process.pid}-${mode}.pdf`)
+          fs.writeFileSync(file, canvas.toBufferSync('pdf'))
+          try { return execFileSync('pdftotext', ['-bbox', file, '-']).toString() }
+          finally { try { fs.unlinkSync(file) } catch {} }
+        })() : ""
+        return {metrics: ctx.measureText(TEXT), outline: ctx.outlineText(TEXT).d, pdf}
+      }
+      const auto = snapshot("auto")
+      for (const mode of MODES){
+        const other = snapshot(mode)
+        assert.deepEqual(other.metrics, auto.metrics, `${mode}: measureText`)
+        assert.equal(other.outline, auto.outline, `${mode}: outlineText`)
+        assert.equal(other.pdf, auto.pdf, `${mode}: pdf text & positions`)
+      }
+    })
+  })
+
+  describe("textWrap", () => {
+    const W = 600, H = 400, X = 100, Y = 60, MEASURE = 200, TEXT = "one two three four five six seven eight nine ten"
+
+    beforeEach(() => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+    })
+
+    test("blank line fonts", () => {
+      ctx.font = "24px TestFace"
+      ctx.textWrap = true
+      let family = ctx.measureText("x").lines[0].runs[0].family
+      for (const [text, count] of /** @type {const} */ ([["x\n", 2], ["\n", 2], ["a\n\nb", 3], ["a\n  \nb", 3]])){
+        let {lines} = ctx.measureText(text, MEASURE)
+        assert.equal(lines.length, count, `${JSON.stringify(text)} line count`)
+        lines.forEach((line, i) => {
+          assert.equal(line.runs.length, 1, `${JSON.stringify(text)} line ${i} should have one run`)
+          assert.equal(line.runs[0].family, family)
+        })
+      }
+    })
+
+    test("rtl hard breaks", () => {
+      // wrapped lines mixing RTL characters with newlines used to bring down the whole process
+      ctx.font = "24px TestFace"
+      ctx.textWrap = true
+      for (const direction of /** @type {const} */ (["ltr", "rtl"])){
+        ctx.direction = direction
+        for (const text of ["x\n", "a\n\nb", "abc שלום\nمرحبا def", "‮.‍\n"]){
+          ctx.fillText(text, X, Y, MEASURE)
+          assert(ctx.measureText(text, MEASURE).lines.length >= 2)
+        }
+      }
+    })
+
+    test("justify", () => {
+      ctx.font = "24px TestFace"
+      ctx.textWrap = true
+      ctx.textAlign = "justify"
+      let {lines} = ctx.measureText(TEXT, MEASURE)
+      assert(lines.length > 2, "the text should wrap onto several lines")
+      // every line but the last is stretched to span the measure (allowing for glyph side-bearings)
+      for (const line of lines.slice(0, -1)){
+        assert.nearEqual(line.x, 0, 3)
+        assert.nearEqual(line.x + line.width, MEASURE, 3)
+      }
+      assert(lines[lines.length - 1].width < MEASURE - 20, "the final line keeps its natural width")
+    })
+
+    test("justify in rtl", () => {
+      ctx.font = "24px TestFace"
+      ctx.textWrap = true
+      ctx.textAlign = "justify"
+      ctx.direction = "rtl"
+      let {lines} = ctx.measureText(TEXT, MEASURE)
+      assert(lines.length > 2, "the text should wrap onto several lines")
+      // in rtl the measure sits to the left of the anchor, as it does for right-aligned text…
+      for (const line of lines.slice(0, -1)){
+        assert.nearEqual(line.x, -MEASURE, 3)
+        assert.nearEqual(line.x + line.width, 0, 3)
+      }
+      // …and the final, unjustified line ends at the anchor
+      let last = lines[lines.length - 1]
+      assert(last.width < MEASURE - 20, "the final line keeps its natural width")
+      assert.nearEqual(last.x + last.width, 0, 3)
+
+      // as does a single line that isn't wrapping at all
+      ctx.textWrap = false
+      let single = ctx.measureText("short line").lines[0]
+      assert.nearEqual(single.x + single.width, 0, 3)
+      ctx.direction = "ltr"
+    })
+
+    test("line baselines", () => {
+      // skparagraph rounds its line heights to whole pixels, so line metrics put the baseline up to
+      // half a pixel away from where the glyphs are actually drawn
+      const TEXT = "HHH ".repeat(12).trim()
+      for (const size of [18, 31])
+        for (const dy of [0, 0.25, 0.5, 0.75])
+          for (const textBaseline of /** @type {const} */ (["alphabetic", "top"])){
+            // aliased glyphs land on whole pixels, and 'H' sits flat on the baseline, so each line's
+            // last painted row is the row above its alphabetic baseline
+            const canvas = new Canvas(W, H), ctx = canvas.getContext("2d")
+            Object.assign(ctx, {font: `${size}px/1.25 TestFace`, textWrap: true, textBaseline, fontSmoothing: false})
+            const y = Y + dy
+            ctx.fillText(TEXT, X, y, MEASURE)
+            const {data} = ctx.getImageData(0, 0, W, H),
+                  {lines} = ctx.measureText(TEXT, MEASURE)
+            assert(lines.length > 2, "the text should wrap onto several lines")
+            for (const [i, line] of lines.entries()){
+              let baseline = Math.round(y + line.alphabeticBaseline), bottom = null
+              for (let row = baseline - 2; row <= baseline + 2; row++)
+                for (let x = 0; x < W; x++) if (data[(row * W + x) * 4 + 3] > 128){ bottom = row; break }
+              assert.equal(bottom, baseline - 1,
+                `${size}px ${textBaseline} at y+${dy}, line ${i}: glyphs end on row ${bottom}, expected ${baseline - 1}`)
+            }
+          }
+    })
+
+    test("decorations", () => {
+      for (const textAlign of /** @type {const} */ (["left", "center", "right"])){
+        // draw only the decoration (transparent glyphs) with lines spaced far enough apart that
+        // each one's underline stays within its own band
+        const canvas = new Canvas(W, H), ctx = canvas.getContext("2d")
+        Object.assign(ctx, {font: "24px/3 TestFace", textWrap: true, textAlign, textDecoration: "underline black", fillStyle: "rgba(0,0,0,0)"})
+        ctx.fillText(TEXT, X + MEASURE, Y, MEASURE)
+        let {data} = ctx.getImageData(0, 0, W, H),
+            {lines} = ctx.measureText(TEXT, MEASURE)
+        assert(lines.length > 2, "the text should wrap onto several lines")
+        for (const [i, line] of lines.entries()){
+          let y0 = Math.round(Y + line.alphabeticBaseline), xs = []
+          for (let y = y0; y < y0 + 12; y++) for (let x = 0; x < W; x++) if (data[(y * W + x) * 4 + 3] > 128) xs.push(x)
+          assert(xs.length, `line ${i} should be underlined`)
+          assert.nearEqual(Math.min(...xs), X + MEASURE + line.x, 3)
+          assert.nearEqual(Math.max(...xs) + 1, X + MEASURE + line.x + line.width, 3)
+        }
+      }
+    })
+  })
+
+  describe("selectable PDF text for", {skip: hasPdftotext ? false : "pdftotext (poppler) not installed"}, () => {
+    // pdftotext wraps RTL/bidi segments in Unicode bidi control characters (LRM/RLM,
+    // LRE…RLO, isolates); strip them and collapse whitespace so we compare plain text.
+    const BIDI_CONTROLS = /[‎‏‪-‮⁦-⁩]/g
+    const normalize = s => s.replace(BIDI_CONTROLS, "").replace(/\s+/g, " ").trim()
+
+    // a bundled face (under a collision-proof alias) rather than a system font, so the Latin cases
+    // don't depend on what fontconfig substitutes for Helvetica. It carries `fi`/`fl` ligatures,
+    // which is what the ligature case needs — the emoji/RTL cases still fall back to system faces.
+    beforeEach(() => {
+      FontLibrary.use("TestFace", [findFont("montserrat-latin/montserrat-v30-latin-regular.woff2")])
+      assert(FontLibrary.has("TestFace"), "the bundled face should be registered for each test")
+    })
+
+    let counter = 0
+    /**
+     * @param {string} str
+     * @param {{font?: string, width?: number, height?: number, maxWidth?: number, setup?: (ctx: import('../../lib').CanvasRenderingContext2D) => void}} [opts]
+     */
+    function pdfText(str, {font = "48px TestFace", width = 600, height = 120, maxWidth, setup} = {}){
+      const canvas = new Canvas(width, height)
+      const ctx = canvas.getContext('2d')
+      ctx.font = font
+      if (setup) setup(ctx)
+      ctx.fillText(str, 20, 70, maxWidth)
+
+      const file = path.join(os.tmpdir(), `skia-canvas-pdf-${process.pid}-${counter++}.pdf`)
+      fs.writeFileSync(file, canvas.toBufferSync('pdf'))
+      try { return normalize(execFileSync('pdftotext', [file, '-']).toString()) }
+      finally { try { fs.unlinkSync(file) } catch {} }
+    }
+
+    test("plain Latin", () => {
+      assert.equal(pdfText("Hello World"), "Hello World")
+    })
+
+    test("ligatures", () => {
+      // e.g. an "fi"/"ffl" ligature glyph must copy back as "f","i" — the whole point of
+      // attaching ActualText, since the font's reverse ToUnicode yields U+FB01/FB02.
+      assert.equal(pdfText("Waffle fi office"), "Waffle fi office")
+    })
+
+    test("emoji ZWJ sequences", () => {
+      assert.equal(pdfText("👨‍👩‍👧 family"), "👨‍👩‍👧 family")
+    })
+
+    test("combining marks", () => {
+      assert.equal(pdfText("café résumé"), "café résumé")
+    })
+
+    test("Arabic", () => {
+      // copies back in logical (not visual) order
+      assert.equal(pdfText("مرحبا بالعالم"), "مرحبا بالعالم")
+    })
+
+    test("Hebrew", () => {
+      // copies back in logical (not visual) order
+      assert.equal(pdfText("שלום עולם"), "שלום עולם")
+    })
+
+    test("mixed bidi", () => {
+      // a reader may linearize mixed bidi in its own order; assert the content is all
+      // present and correct rather than a specific concatenation order.
+      const got = pdfText("abc مرحبا 123")
+      for (const part of ["abc", "مرحبا", "123"]) {
+        assert(got.includes(part), `expected ${JSON.stringify(part)} in ${JSON.stringify(got)}`)
+      }
+    })
+
+    test("hard line breaks", () => {
+      // a single shaped run split across lines must map each line's glyphs to that line's text
+      // (not the run's first clusters, as Skia's extendedVisit reports for every line)
+      assert.equal(pdfText("first line\nsecond line\nthird", {
+        font: "24px TestFace", height: 200, setup: ctx => { ctx.textWrap = true }
+      }), "first line second line third")
+    })
+
+    test("soft wraps", () => {
+      assert.equal(pdfText("alpha beta gamma delta epsilon zeta", {
+        font: "24px TestFace", height: 300, maxWidth: 150, setup: ctx => { ctx.textWrap = true }
+      }), "alpha beta gamma delta epsilon zeta")
+    })
+
+    test("wrapped rtl", () => {
+      const got = pdfText("שלום עולם שלום עולם שלום עולם", {
+        font: "24px TestFace", height: 300, maxWidth: 150, setup: ctx => { ctx.textWrap = true }
+      })
+      assert.equal(got.replace(/\s+/g, ""), "שלוםעולםשלוםעולםשלוםעולם")
+    })
+
+    test("textured text", () => {
+      // a texture fill draws the visible glyphs as a stamped path (no text); an invisible
+      // blob layer carries the utf-8 so the text is still selectable
+      assert.equal(pdfText("textured", {setup: ctx => {
+        ctx.fillStyle = ctx.createTexture([8, 8], {line: 2, color: 'black', angle: 0.4})
+      }}), "textured")
+    })
+
+  })
+
+  describe("SKIA_CANVAS_STRICT", () => {
+    // the flag is read once when lib/classes/neon.js loads, so it can't be toggled in-process.
+    // exercise every strict-mode rejection in a single child process (rather than one per case);
+    // the child collects any mismatch, prints it to stderr, and exits non-zero.
+    test("invalid values", () => {
+      const {execFileSync} = require('node:child_process')
+      const lib = require.resolve('../../lib')
+      const child = `
+        const {Canvas} = require(${JSON.stringify(lib)})
+        const ctx = new Canvas(10, 10).getContext('2d')
+
+        // [property, value, shouldThrow] — invalid values throw under strict; valid ones must not
+        const cases = [
+          // rejected by the JS parsers (css.js \`parsed\`)
+          ['font',           'not-a-font',                      true],
+          ['fontVariant',    'bogus',                           true],
+          ['fontVariant',    'small-caps bogus',                true],
+          ['fontStretch',    'bogus',                           true],
+          ['letterSpacing',  'bogus',                           true],
+          // ex & ch are deliberately unsupported units, not oversights
+          ['wordSpacing',    '2ex',                             true],
+          ['letterSpacing',  '2ch',                             true],
+          ['font',           '2ex serif',                       true],
+          ['filter',         'blur(1ex)',                       true],
+          ['textDecoration', 'notaword blue',                   true],
+          ['filter',         'blur(2px)junk',                   true],
+          ['filter',         'blur(2px) garbage(3)',            true],
+          ['fontVariationSettings', {wg: 700},                  true],
+          ['fontVariationSettings', null,                       true],
+          ['fontFeatureSettings',   {liga: -1},                 true],
+          // rejected Rust-side via the ⚠️ canary (neon.js \`rustError\`)
+          ['textDecoration', 'blahblah',                        true],
+          ['textDecoration', 'underline notacolor',             true],
+          ['fontInstance',   'No Such Instance',                true],
+          ['fontInstance',   42,                                true],
+          // valid values must survive strict mode untouched
+          ['fontVariant',    'small-caps',                      false],
+          ['letterSpacing',  '1rem',                            false],
+          ['textDecoration', 'line-through oklch(0.7 0.1 200)', false],
+          ['filter',         'blur(2px) invert(50%)',           false],
+          ['fontVariationSettings', {wght: 700},                false],
+          ['fontFeatureSettings',   {liga: false},              false],
+          ['fontFeatureSettings',   {},                         false],
+          ['fontInstance',          'auto',                     false],
+        ]
+
+        const fails = []
+        for (const [prop, value, shouldThrow] of cases){
+          let threw = null
+          try { ctx[prop] = value } catch(e){ threw = e }
+          if (shouldThrow && !threw)
+            fails.push(prop + ' = ' + JSON.stringify(value) + ' should have thrown')
+          else if (shouldThrow && !(threw instanceof TypeError))
+            fails.push(prop + ' = ' + JSON.stringify(value) + ' threw ' + threw.constructor.name + ', expected TypeError')
+          else if (!shouldThrow && threw)
+            fails.push(prop + ' = ' + JSON.stringify(value) + ' should not have thrown (' + threw.message + ')')
+        }
+        if (fails.length){ console.error(fails.join('\\n')); process.exit(1) }
+      `
+      try {
+        execFileSync(process.execPath, ['-e', child], {
+          env: {...process.env, SKIA_CANVAS_STRICT: '1'},
+          encoding: 'utf8',
+          stdio: ['ignore', 'ignore', 'pipe'],
+        })
+      } catch (err) {
+        assert.fail('strict-mode expectations failed:\n' + String(err.stderr || err.message).trim())
+      }
+    })
+  })
+})

@@ -1,0 +1,60 @@
+diff --git a/skia-bindings/build_support/binaries_config.rs b/skia-bindings/build_support/binaries_config.rs
+index 71012f3..8917594 100644
+--- a/skia-bindings/build_support/binaries_config.rs
++++ b/skia-bindings/build_support/binaries_config.rs
+@@ -143,20 +143,25 @@ impl BinariesConfiguration {
+                         from.display(),
+                         to.display(),
+                         e
+                     )
+                 });
+             }
+         }
+ 
+         // On Linux, the order is significant, first the static libraries we built, and then
+         // the system libraries.
++
++        // link the static fontconfig library
++        cargo::add_link_search("/opt/skia-static-libs");
++        cargo::add_static_link_libs(&target, ["fontconfig"]);
++
+         cargo::add_static_link_libs(&target, self.built_libraries(true));
+         cargo::add_link_libs(&self.link_libraries);
+     }
+ 
+     /// Import library and additional files from `from_dir` to the output directory.
+     pub fn import(&self, from_dir: &Path, import_bindings: bool) -> io::Result<()> {
+         let output_directory = &self.output_directory;
+         self.copy_libs_and_additional_files(from_dir, output_directory, import_bindings)
+     }
+ 
+diff --git a/skia-bindings/build_support/platform/linux.rs b/skia-bindings/build_support/platform/linux.rs
+index fce693b..5c50b43 100644
+--- a/skia-bindings/build_support/platform/linux.rs
++++ b/skia-bindings/build_support/platform/linux.rs
+@@ -30,23 +30,22 @@ impl PlatformDetails for Linux {
+     }
+ 
+     fn link_libraries(&self, features: &Features) -> Vec<String> {
+         link_libraries(features)
+     }
+ }
+ 
+ pub fn link_libraries(features: &Features) -> Vec<String> {
+     let mut libs = vec!["stdc++".to_string()];
+ 
+-    // Use pkg-config for system libraries when available
+-    add_pkg_config_libs(&mut libs, "freetype2", &["freetype"]);
+-    add_pkg_config_libs(&mut libs, "fontconfig", &["fontconfig"]);
++    // don't add freetype & fontconfig to the list of shared libraries to be linked
++    // since we'll be adding static versions in binaries_config.rs
+ 
+     if features[feature::GL] {
+         if features[feature::EGL] {
+             add_pkg_config_libs(&mut libs, "egl", &["EGL"]);
+         }
+ 
+         if features[feature::X11] {
+             add_pkg_config_libs(&mut libs, "gl", &["GL"]);
+         }
+ 

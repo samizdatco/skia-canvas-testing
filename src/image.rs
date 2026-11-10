@@ -1,0 +1,472 @@
+use std::cell::RefCell;
+use std::io::Cursor;
+use std::sync::OnceLock;
+use tiff::encoder::TiffEncoder;
+use tiff::tags::Tag as TiffTag;
+use neon::{prelude::*, types::buffer::TypedArray};
+use skia_safe::{
+  Image as SkImage, ImageInfo, ColorType, ColorSpace, AlphaType, Data, Size,
+  Matrix, Picture, Pixmap, Rect,
+  matrix::ScaleToFit,
+  image::{images, CachingHint},
+  webp_encoder,
+};
+use crate::bridge::*;
+use crate::pdf;
+use crate::context::Context2D;
+use crate::gfx::cache::Cache;
+use crate::gfx::page::Page;
+use crate::mem;
+use crate::svg;
+
+pub type BoxedImage = JsBox<RefCell<Image>>;
+impl Finalize for Image {}
+
+pub struct Image{
+  src:String,
+  pub autosized:bool,
+  pub content: Content,
+  footprint: mem::v8::Footprint,
+}
+
+impl Default for Image{
+  fn default() -> Self {
+    Image{ content:Content::Loading, autosized:false, src:"".to_string(), footprint:mem::v8::Footprint::default() }
+  }
+}
+
+impl Drop for Image{
+  fn drop(&mut self) {
+    self.content.release();
+  }
+}
+
+#[derive(Default)]
+pub enum Content{
+  Bitmap(SkImage), // embeds its own intrinsic size and colorspace
+  Vector(Picture, Size, ColorSpace), // needs to record them separately
+  #[default]
+  Loading,
+  Broken,
+}
+
+impl Clone for Content{
+  fn clone(&self) -> Self {
+      match self{
+        Content::Bitmap(img) => Content::Bitmap(img.clone()),
+        Content::Vector(pict, size, space) => Content::Vector(pict.clone(), *size, space.clone()),
+        _ => Content::default()
+      }
+  }
+}
+
+impl Content{
+  // snapshot the context as a bitmap, already clamped to its own gamut
+  pub fn raster_from_context(ctx:&mut Context2D) -> Self{
+    ctx.get_image().map(Content::Bitmap).unwrap_or_default()
+  }
+
+  // flatten the context into a Picture, tagged with the gamut its colors were authored in
+  pub fn vector_from_context(ctx:&mut Context2D) -> Self{
+    let (size, space) = (ctx.bounds.size(), ctx.color_space());
+    ctx.get_picture().map(|p| Content::Vector(p, size, space)).unwrap_or_default()
+  }
+
+  pub fn from_image_data(image_data:ImageData) -> Self{
+    let info = image_data.image_info();
+    images::raster_from_data(&info, &image_data.buffer, info.min_row_bytes())
+      .map(Content::Bitmap)
+      .unwrap_or_default()
+  }
+
+  // drop the current content safely/immediately
+  pub fn release(&mut self){
+    let content = std::mem::take(self);
+
+    if let Content::Vector(pict, ..) = &content{
+      // clear any cached rasters keyed to the Picture id
+      let id = Page::picture_id(pict);
+      Cache::shared().evict(id);
+      crate::gfx::render_soon(move |cache| cache.evict(id));
+    }
+
+    if let Content::Bitmap(img) = &content{
+      // drop gpu-backed bitmaps on the render_thread
+      if img.is_texture_backed(){
+        crate::gfx::render_soon(move |_| drop(content));
+      }
+    }
+  }
+
+  // Swap in new content, releasing whatever was there before.
+  pub fn replace(&mut self, next: Content){
+    self.release();
+    *self = next;
+  }
+
+  pub fn size(&self) -> Size {
+    match &self {
+      Content::Bitmap(img) => img.dimensions().into(),
+      Content::Vector(_, size, _) => *size,
+      _ => Size::new_empty()
+    }
+  }
+
+  pub fn native_bytes(&self) -> usize {
+    match &self {
+      // a lazily-decoded bitmap's *decoded* pixels live in Skia's resource cache (so no
+      // accounting is necessary), but the *encoded* bytes are included in the v8 footprint
+      Content::Bitmap(img) if img.is_lazy_generated() =>
+        img.encoded_data().map(|data| data.size()).unwrap_or(0),
+      Content::Bitmap(img) => img.image_info().compute_min_byte_size(),
+      Content::Vector(pict, ..) => pict.approximate_bytes_used(),
+      _ => 0,
+    }
+  }
+
+  pub fn is_complete(&self) -> bool {
+    !matches!(self, Content::Loading)
+  }
+
+  pub fn is_drawable(&self) -> bool {
+    !matches!(self, Content::Loading | Content::Broken)
+  }
+
+  // shrink the src crop to just its overlap with the actual bounds and adjust dst to match
+  // (or return None if there's nothing to be drawn)
+  pub fn drawable_rects(size: Size, src: Rect, dst: Rect) -> Option<(Rect, Rect)> {
+    // calculate the scale-factor and position shift from the src crop to dst rect (or None if src is empty)
+    let placement = Matrix::rect_2_rect(src, dst, ScaleToFit::Fill)?;
+
+    // find the actual overlap (if any) between the src crop rect and the bounds
+    let mut crop = src;
+    crop.intersect(Rect::from_size(size)).then(||
+      (crop, placement.map_rect(crop).0) // return the clipped src and scaled/shifted dst rect
+    )
+  }
+}
+
+
+#[derive(Debug)]
+pub struct ImageData{
+  pub width: f32,
+  pub height: f32,
+  pub buffer: Data,
+  color_type: ColorType,
+  color_space: ColorSpace,
+}
+
+impl ImageData{
+  pub fn new(buffer:Data, width:f32, height:f32, color_type:String, color_space:String) -> Self{
+    let color_type = to_color_type(&color_type);
+    let color_space = to_color_space(&color_space);
+    Self{ buffer, width, height, color_type, color_space }
+  }
+
+  pub fn image_info(&self) -> ImageInfo{
+    ImageInfo::new(
+      (self.width as _, self.height as _),
+      self.color_type,
+      AlphaType::Unpremul,
+      self.color_space.clone()
+    )
+  }
+
+  // re-encode the pixels into dst_info's color type and write them to dst
+  pub fn read_pixels(&self, dst_info:&ImageInfo, dst:&mut [u8]) -> bool{
+    let src_info = self.image_info();
+    match images::raster_from_data(&src_info, self.buffer.clone(), src_info.min_row_bytes()){
+      Some(image) => image.read_pixels(
+        dst_info, dst, dst_info.min_row_bytes(), (0,0), CachingHint::Allow
+      ),
+      None => false
+    }
+  }
+}
+
+
+//
+// -- Javascript Methods --------------------------------------------------------------------------
+//
+
+pub fn new(mut cx: FunctionContext) -> JsResult<BoxedImage> {
+  let this = RefCell::new(Image::default());
+  Ok(cx.boxed(this))
+}
+
+pub fn get_src(mut cx: FunctionContext) -> JsResult<JsString> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let this = this.borrow();
+
+  Ok(cx.string(&this.src))
+}
+
+pub fn set_src(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let mut this = this.borrow_mut();
+
+  let src = cx.argument::<JsString>(1)?.value(&mut cx);
+  this.src = src;
+  Ok(cx.undefined())
+}
+
+pub fn set_data<'a>(mut cx: FunctionContext<'a>) -> NeonResult<Handle<'a, JsBoolean>> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let mut this = this.borrow_mut();
+  let buffer = cx.argument::<JsBuffer>(1)?;
+  let data = Data::new_copy(buffer.as_slice(&cx));
+  let fit_view_box = opt_bool_arg(&mut cx, 4).unwrap_or(false); // use viewBox for SVGs without width/height
+
+  // since the Image may have already been loaded and then had its `src` reset, clear the svg sizing flag
+  this.autosized = false;
+
+  let new_content = if let Some(raw_info) = opt_image_info_arg(&mut cx, 2)?{
+    // First, check for an optional dims argument and interpret the buffer as raw rgba if present
+    match images::raster_from_data(&raw_info, data, raw_info.min_row_bytes()){
+      Some(image) => Content::Bitmap(image),
+      None => Content::Broken
+    }
+  }else if let Some(image) = images::deferred_from_encoded_data(&data, None){
+    // Next, try interpreting the data as an encoded bitmap
+    Content::Bitmap(image)
+  }else if pdf::is_pdf(&data){
+    // Next, look for the PDF magic number and record the requested page as a Picture
+    let page_num = match opt_float_arg(&mut cx, 3){
+      None => Some(1),
+      Some(num) if num >= 1.0 && num.fract() == 0.0 => Some(num as usize),
+      Some(_) => None
+    };
+    match page_num.and_then(|num| pdf::read_page(&data, num)){
+      Some((picture, size)) => Content::Vector(picture, size, ColorSpace::new_srgb()), // hayro only supports sRGB
+      None => Content::Broken
+    }
+  }else if let Some((picture, size, autosized)) = svg::read_document(&data, fit_view_box){
+    // Finally, try parsing as SVG
+    this.autosized = autosized;
+    Content::Vector(picture, size, ColorSpace::new_srgb()) // skia only parses sRGB
+  }else{
+    Content::Broken
+  };
+
+  this.content.replace(new_content);
+  let bytes = this.content.native_bytes(); // picture-size for SVG, w×h×4 for bitmap, encoded-bytes for lazy
+  this.footprint.set(bytes); // record the allocation size for v8
+  let drawable = this.content.is_drawable();
+  drop(this); // release the RefCell borrow before calling into cx (since it might reenter)
+  Ok(cx.boolean(drawable))
+}
+
+pub fn dispose(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+  // Synchronously release decoded/loaded content (rather than waiting until for the next event
+  // loop tick gets around to calling Drop). Using the image after disposal is caught by js
+  let this = cx.argument::<BoxedImage>(0)?;
+  let mut this = this.borrow_mut();
+  std::mem::take(&mut this.content).release();
+  this.footprint.clear(); // record the dealloc for v8
+  drop(this); // release the RefCell borrow before calling into cx (since it might reenter)
+  Ok(cx.undefined())
+}
+
+pub fn get_width(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let this = this.borrow();
+  Ok(cx.number(this.content.size().width).upcast())
+}
+
+pub fn get_height(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let this = this.borrow();
+  Ok(cx.number(this.content.size().height).upcast())
+}
+
+pub fn get_complete(mut cx: FunctionContext) -> JsResult<JsBoolean> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let this = this.borrow();
+  Ok(cx.boolean(this.content.is_complete()))
+}
+
+// wrap raw image bytes in an uncompressed TIFF with an ICC profile (for Sharp handoff of ImageData buffers)
+pub fn to_tiff(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let src = image_data_arg(&mut cx, 0)?;
+  let src_info = src.image_info();
+
+  // convert to the spec's `to` type (if present), or else keep the ImageData's existing colorType
+  let spec = opt_object_arg(&mut cx, 1);
+  let color_type = match spec.as_ref().and_then(|spec| opt_string_for_key(&mut cx, spec, "to")){
+    Some(name) => to_color_type(&name),
+    None => src_info.color_type()
+  };
+  let dst_info = src_info.with_color_type(color_type);
+  let (bits_per_channel, format):(u16, u16) = match color_type{
+    ColorType::RGBA8888 => (8, 1),           // u8
+    ColorType::R16G16B16A16UNorm => (16, 1), // u16
+    ColorType::RGBAF32 => (32, 3),           // f32
+    _ => return Ok(cx.undefined().upcast())
+  };
+
+  // count the number of actually-used channels (for cases where there's no alpha)
+  let count = (dst_info.width() * dst_info.height()) as usize;
+  let stride = dst_info.bytes_per_pixel(); // bytes Skia renders per pixel
+  let bytes_per_channel = (bits_per_channel / 8) as usize;
+  let samples = spec.as_ref()
+    .and_then(|spec| opt_float_for_key(&mut cx, spec, "channels"))
+    .map(|n| n as usize)
+    .unwrap_or(stride / bytes_per_channel);
+  let kept = samples * bytes_per_channel; // bytes written to the TIFF per pixel
+  let byte_size = count * kept;
+
+  // only display-p3 images need an embedded profile
+  static DISPLAY_P3_ICC:OnceLock<Option<Vec<u8>>> = OnceLock::new();
+  let icc = match src_info.color_space().as_ref().map(from_color_space){
+    Some("display-p3") => DISPLAY_P3_ICC.get_or_init(||{
+      let mut pixel = [0u8; 4];
+      let info = ImageInfo::new_n32_premul((1, 1), to_color_space("display-p3"));
+      let pixmap = Pixmap::new(&info, &mut pixel, info.min_row_bytes())?;
+
+      let mut webp = Vec::new();
+      let opts = webp_encoder::Options{ compression: webp_encoder::Compression::Lossy, quality: 0.0 };
+      if !webp_encoder::encode(&pixmap, &mut webp, &opts) { return None }
+      if webp.get(..4)? != b"RIFF" || webp.get(8..12)? != b"WEBP" { return None }
+
+      // find the `ICCP` RIFF chunk
+      let mut rest = webp.get(12..)?; // skip the header
+      while let Some(chunk_header) = rest.get(..8){
+        let size = u32::from_le_bytes(chunk_header[4..].try_into().ok()?) as usize;
+        if &chunk_header[..4] == b"ICCP" { return rest.get(8..8+size).map(|icc| icc.to_vec()) }
+        rest = rest.get(8 + size + (size & 1)..)?; // chunks are padded to an even length
+      }
+      None
+    }).as_deref(),
+    _ => None // sRGB is the Sharp default, so no profile is necessary
+  };
+
+  let build_directory = |tiff_bytes: &mut Cursor<Vec<u8>>, strip_offset: u32| -> Result<(), tiff::TiffError> {
+    let samples = samples as u16;
+    let mut enc = TiffEncoder::new(tiff_bytes)?;
+    let mut dir = enc.image_directory()?;
+    dir.write_tag(TiffTag::ImageWidth, dst_info.width() as u32)?;
+    dir.write_tag(TiffTag::ImageLength, dst_info.height() as u32)?;
+    dir.write_tag(TiffTag::BitsPerSample, vec![bits_per_channel; samples as usize].as_slice())?;
+    dir.write_tag(TiffTag::SampleFormat, vec![format; samples as usize].as_slice())?;
+    dir.write_tag(TiffTag::SamplesPerPixel, samples)?;
+    dir.write_tag(TiffTag::Compression, 1u16)?;                     // none
+    dir.write_tag(TiffTag::PhotometricInterpretation, 2u16)?;       // RGB
+    if samples > 3 { dir.write_tag(TiffTag::ExtraSamples, 2u16)?; } // un-premultiplied alpha
+    dir.write_tag(TiffTag::PlanarConfiguration, 1u16)?;             // chunky
+    dir.write_tag(TiffTag::RowsPerStrip, dst_info.height() as u32)?;
+    dir.write_tag(TiffTag::StripOffsets, strip_offset)?;
+    dir.write_tag(TiffTag::StripByteCounts, byte_size as u32)?;
+    if let Some(icc) = icc{ dir.write_tag(TiffTag::IccProfile, icc)?; }
+    dir.finish()
+  };
+
+  // measure the directory so we know where the pixels will start
+  let mut tiff_bytes = Cursor::new(Vec::new());
+  if build_directory(&mut tiff_bytes, 0).is_err(){ return Ok(cx.undefined().upcast()) }
+  let strip_offset = tiff_bytes.get_ref().len();
+
+  // write the actual directory (incorporating the newly-calculated offset)
+  tiff_bytes.set_position(0);
+  build_directory(&mut tiff_bytes, strip_offset as u32).ok();
+  let directory = tiff_bytes.into_inner();
+
+  // write the directory into a js array then have Skia decode into its reserved space
+  let mut buffer = cx.array_buffer(strip_offset + count * stride)?;
+  let encoded = {
+    let container = buffer.as_mut_slice(&mut cx);
+    container[..strip_offset].copy_from_slice(&directory);
+    src.read_pixels(&dst_info, &mut container[strip_offset..])
+  };
+
+  // drop the fourth channel if this is a no-alpha colorType
+  if encoded && kept < stride {
+    let pixels = &mut buffer.as_mut_slice(&mut cx)[strip_offset..];
+    for p in 0..count {
+      pixels.copy_within(p * stride .. p * stride + kept, p * kept);
+    }
+  }
+
+  match encoded{
+    true => Ok(JsUint8Array::from_region(&mut cx, &buffer.region(0, strip_offset + byte_size))?.upcast()),
+    false => Ok(cx.undefined().upcast())
+  }
+}
+
+// reformat ImageData's pixels to a layout that libvips supports (see SHARP_FORMATS for specs)
+pub fn to_raw(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let image_data = object_arg(&mut cx, 0, "imageData")?;
+  let from = string_for_key(&mut cx, &image_data, "colorType")?;
+
+  let spec = object_arg(&mut cx, 1, "spec")?;
+  let to = opt_string_for_key(&mut cx, &spec, "to");
+  let channels = opt_float_for_key(&mut cx, &spec, "channels").unwrap_or(4.0) as usize;
+  let bits = opt_float_for_key(&mut cx, &spec, "bits").unwrap_or(8.0) as usize;
+
+  // if there isn't a `to` format in the spec the layout works as-is, so skip the reencoding
+  if to.is_none(){
+    let pixels:Handle<JsObject> = image_data.get(&mut cx, "data")?;
+    match bits {
+      8 => return Ok(pixels.upcast()),
+      16 => {
+        // 16-bit formats need to be in a Uint16Array, so return a u16 view of our u8-based source buffer
+        let buffer:Handle<JsArrayBuffer> = pixels.get(&mut cx, "buffer")?;
+        let byte_offset = float_for_key(&mut cx, &pixels, "byteOffset")? as usize;
+        let num_ushorts = float_for_key(&mut cx, &pixels, "byteLength")? as usize / 2;
+        if byte_offset % 2 == 0 { // only possible if byte-aligned
+          return Ok(JsUint16Array::from_region(&mut cx, &buffer.region(byte_offset, num_ushorts))?.upcast())
+        }
+      }
+      _ => return cx.throw_type_error(format!("Unsupported bit depth: {}", bits))
+    }
+  }
+
+  // count the number of actually-used channels (since some types don't include alpha)
+  let src = image_data_arg(&mut cx, 0)?;
+  let dst_info = match &to{
+    Some(color_type) => src.image_info().with_color_type(to_color_type(color_type)),
+    None => src.image_info()
+  };
+  let count = (dst_info.width() * dst_info.height()) as usize;
+  let stride = dst_info.bytes_per_pixel();          // bytes Skia writes per pixel
+  let kept = channels * bits / 8;                   // bytes libvips expects per pixel
+
+  // re-encode to a libvips-friendly layout
+  let mut buffer = cx.array_buffer(count * stride)?;
+  if !src.read_pixels(&dst_info, buffer.as_mut_slice(&mut cx)){
+    let target = to.as_deref().unwrap_or(&from);
+    return cx.throw_type_error(format!("Could not convert pixels from '{}' to '{}'", from, target))
+  }
+
+  // if fewer than 4 channels are needed, strip them out
+  if kept < stride {
+    let pixels = buffer.as_mut_slice(&mut cx);
+    for p in 0..count {
+      pixels.copy_within(p * stride .. p * stride + kept, p * kept);
+    }
+  }
+
+  match bits > 8{
+    true => Ok(JsUint16Array::from_region(&mut cx, &buffer.region(0, count * channels))?.upcast()),
+    false => Ok(JsUint8Array::from_region(&mut cx, &buffer.region(0, count * channels))?.upcast())
+  }
+}
+
+pub fn pixels(mut cx: FunctionContext) -> JsResult<JsValue> {
+  let this = cx.argument::<BoxedImage>(0)?;
+  let this = this.borrow_mut();
+  let (color_type, color_space) = image_data_settings_arg(&mut cx, 1);
+
+  let info = ImageInfo::new(this.content.size().to_floor(), color_type, AlphaType::Unpremul, color_space);
+  let mut pixels = cx.buffer(info.bytes_per_pixel() * (info.width() * info.height()) as usize)?;
+
+  match &this.content{
+    Content::Bitmap(image) => {
+      match image.read_pixels(&info, pixels.as_mut_slice(&mut cx), info.min_row_bytes(), (0,0), CachingHint::Allow){
+        true => Ok(pixels.upcast()),
+        false => Ok(cx.undefined().upcast())
+      }
+
+    }
+    _ => Ok(cx.undefined().upcast())
+  }
+}

@@ -1,0 +1,20 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+imports2 = []
+imports3 = []
+imports4 = []
+data = []
+
+[profile.release]
+strip = "debuginfo"
+
+[profile.unstripped]
+inherits = "release"
+strip = "none"

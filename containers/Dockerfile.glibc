@@ -1,0 +1,45 @@
+# select the base via TARGETARCH
+FROM quay.io/pypa/manylinux_2_28_x86_64 AS base-amd64
+ENV GCC_TRIPLE=x86_64-redhat-linux
+FROM quay.io/pypa/manylinux_2_28_aarch64 AS base-arm64
+ENV GCC_TRIPLE=aarch64-redhat-linux
+FROM base-${TARGETARCH} AS skia-build-env
+ARG TARGETARCH
+
+# rank mirrors by speed, parallelize downloads, and skip weak deps
+RUN printf 'fastestmirror=1\nmax_parallel_downloads=10\ninstall_weak_deps=False\n' >> /etc/dnf/dnf.conf
+
+RUN dnf install -y \
+      clang llvm ninja-build make gperf pkgconf-pkg-config zip \
+      expat-devel libpng-devel zlib-devel \
+      python3.12 python3.12-pip \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+    && dnf clean all
+
+# point clang at the C++20 version of gcc (otherwise it uses base gcc-8)
+ARG GCC_TOOLSET=15
+ENV GCC_INSTALL_DIR=/opt/rh/gcc-toolset-${GCC_TOOLSET}/root/usr/lib/gcc/${GCC_TRIPLE}/${GCC_TOOLSET}
+ENV SKIA_GN_ARGS="extra_cflags_cc=[\"--gcc-install-dir=${GCC_INSTALL_DIR}\"]"
+ENV BINDGEN_EXTRA_CLANG_ARGS=--gcc-install-dir=${GCC_INSTALL_DIR}
+
+# install Node
+ARG NODE_MAJOR=24
+RUN curl -fSL --retry 5 --retry-delay 3 --connect-timeout 30 \
+      https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && dnf install -y nodejs && dnf clean all
+
+# install gh
+ARG GH_VERSION=2.76.2
+ARG GH_URL=https://github.com/cli/cli/releases/download/v$GH_VERSION/gh_${GH_VERSION}_linux_$TARGETARCH.tar.gz
+RUN curl -fSL --retry 5 --retry-delay 3 --connect-timeout 30 $GH_URL | tar xz --strip-components=2 -C /usr/local/bin
+
+# manually build static freetype & fontconfig in /opt/skia-static-libs
+COPY ./install-fontlibs.sh /opt
+COPY ./freetype.cfg /opt
+RUN bash /opt/install-fontlibs.sh \
+    && mkdir -p /opt/skia-static-libs \
+    && cp "$(find /usr/local -name libfontconfig.a | head -1)" /opt/skia-static-libs
+
+WORKDIR /opt
+CMD ["bash"]
