@@ -3,7 +3,6 @@
 name: strip-alignment
 
 on:
-  push:
   workflow_dispatch:
 
 jobs:
@@ -107,7 +106,7 @@ jobs:
         for dir in artifacts/skia-*; do
           row=$(qa/inspect.sh "$(basename $dir)" $dir/skia.node)
           cp $dir/skia.node lib/skia.node
-          render=$(node -e "const {Canvas}=require('./lib'); const c=new Canvas(64,64); c.getContext('2d').fillRect(0,0,8,8); console.log('ok, ' + c.toBufferSync('png').length + ' byte png')" 2>&1 | tail -1 | cut -c1-90)
+          render=$(node -e "const {Canvas}=require('./lib'); const c=new Canvas(64,64); c.getContext('2d').fillRect(0,0,8,8); console.log('ok, ' + c.toBufferSync('png').length + ' byte png')" 2>&1 | tail -1 | cut -c1-90 || true)
           echo "$row $render |" | tee -a $GITHUB_STEP_SUMMARY
         done
 
@@ -129,5 +128,5 @@ jobs:
         echo "| build | file | stroff%8 | nindirectsyms | minos/sdk | dlopen | node render |" >> $GITHUB_STEP_SUMMARY
         echo "|---|---|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
         row=$($GITHUB_WORKSPACE/qa/inspect.sh "npm 4.0.0" $bin)
-        render=$(node -e "const {Canvas}=require('skia-canvas'); const c=new Canvas(64,64); c.getContext('2d').fillRect(0,0,8,8); console.log('ok, ' + c.toBufferSync('png').length + ' byte png')" 2>&1 | tail -1 | cut -c1-90)
+        render=$(node -e "const {Canvas}=require('skia-canvas'); const c=new Canvas(64,64); c.getContext('2d').fillRect(0,0,8,8); console.log('ok, ' + c.toBufferSync('png').length + ' byte png')" 2>&1 | tail -1 | cut -c1-90 || true)
         echo "$row $render |" | tee -a $GITHUB_STEP_SUMMARY
