@@ -1,0 +1,38 @@
+# does the hidden `.AppleSystemUIFont` family (San Francisco) resolve on each macOS version, via coretext and via skia-canvas
+name: system-ui
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: strip-alignment run whose skia-macos-15-1.99.1 artifact to use
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, xcode-27]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+    - uses: actions/download-artifact@v4
+      with:
+        name: skia-macos-15-1.99.1
+        path: lib
+        run-id: ${{ inputs.run_id }}
+        github-token: ${{ github.token }}
+    - name: CoreText's view of the system ui font
+      run: swift qa/system-ui/coretext.swift 2>&1 | grep -v "CoreText note"
+    - name: skia-canvas's view of candidate names
+      run: |
+        npm ci --ignore-scripts
+        node qa/system-ui/skia.js lib
